@@ -2,10 +2,13 @@ import os
 import asyncio
 import threading
 import random
+import logging
 from rubpy import Client, filters
 from rubpy.types import Updates
 import google.generativeai as genai
 from flask import Flask
+
+logging.basicConfig(level=logging.DEBUG)
 
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-pro')
@@ -18,6 +21,7 @@ if session_b64 and not os.path.exists(SESSION_FILE):
     with open(SESSION_FILE, "wb") as f:
         f.write(base64.b64decode(session_b64))
     print("Session file restored from SESSION_B64.")
+    print(f"Restored session file size: {os.path.getsize(SESSION_FILE)} bytes (should be 16384)")
 
 client = Client(name="my_rubika_account")
 
