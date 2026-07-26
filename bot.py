@@ -28,14 +28,14 @@ model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERS
 chat_histories = {}
 MAX_TURNS = 10  # تعداد رد و بدل‌هایی که به خاطر می‌سپاره
 
-# --- Restore Rubika session from env var (so login persists across redeploys) ---
+# --- Restore Rubika session from env vars (split into 2 parts to avoid mobile paste truncation) ---
 SESSION_FILE = "my_rubika_account.rp"
-session_b64 = os.environ.get("SESSION_B64")
+session_b64 = (os.environ.get("SESSION_B64_PART1", "") + os.environ.get("SESSION_B64_PART2", ""))
 if session_b64 and not os.path.exists(SESSION_FILE):
     import base64
     with open(SESSION_FILE, "wb") as f:
         f.write(base64.b64decode(session_b64))
-    print("Session file restored from SESSION_B64.")
+    print(f"Session file restored. Combined base64 length: {len(session_b64)} (should be 21848)")
     print(f"Restored session file size: {os.path.getsize(SESSION_FILE)} bytes (should be 16384)")
 
 client = Client(name="my_rubika_account")
