@@ -11,7 +11,7 @@ from flask import Flask
 logging.basicConfig(level=logging.DEBUG)
 
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-pro')
+model = genai.GenerativeModel('gemini-flash-latest')
 
 # --- Restore Rubika session from env var (so login persists across redeploys) ---
 SESSION_FILE = "my_rubika_account.rp"
@@ -55,3 +55,4 @@ if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     print("Bot is running...")
     client.run(phone_number=os.environ.get("RUBIKA_PHONE"))
+    
