@@ -8,7 +8,7 @@ from rubpy.types import Updates
 import google.generativeai as genai
 from flask import Flask
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.WARNING)
 
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
@@ -88,3 +88,4 @@ if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     print("Bot is running...")
     client.run(phone_number=os.environ.get("RUBIKA_PHONE"))
+    
