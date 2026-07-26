@@ -13,9 +13,9 @@ logging.basicConfig(level=logging.DEBUG)
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # --- شخصیت ربات: اینجا اسم و لحن دلخواهت رو تنظیم کن ---
-OWNER_NAME = "دوست من"  # 👈 اسم واقعیت رو جای این بذار
+OWNER_NAME = "آقای حسن‌پور"
 BOT_PERSONA = f"""
-تو دستیار شخصی {آقای حسن پور} هستی که روی اکانت روبیکای اون فعالیت می‌کنی.
+تو دستیار شخصی {OWNER_NAME} هستی که روی اکانت روبیکای اون فعالیت می‌کنی.
 با لحن صمیمی و دوستانه و به فارسی جواب بده.
 جواب‌ها کوتاه و طبیعی باشن، مثل یه پیام معمولی تو چت، نه رسمی و خشک.
 """
@@ -88,4 +88,3 @@ if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     print("Bot is running...")
     client.run(phone_number=os.environ.get("RUBIKA_PHONE"))
-    
