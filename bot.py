@@ -32,9 +32,10 @@ def run_web():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-@client.on_message_updates(filters.text)
+@client.on_message_updates()
 async def reply_to_pv(update: Updates):
-    user_text = update.text
+    print(f"RAW UPDATE RECEIVED: {update}")
+    user_text = getattr(update, "text", None)
     if not user_text:
         return
     print(f"New message: {user_text}")
