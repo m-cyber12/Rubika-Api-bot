@@ -32,6 +32,16 @@ def run_web():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
+async def test_connection():
+    try:
+        async with Client(name="my_rubika_account") as test_client:
+            result = await test_client.send_message('me', 'Bot deployed successfully - connectivity test ✅')
+            print(f"TEST SEND OK: {result}")
+    except Exception as e:
+        print(f"TEST SEND FAILED: {e}")
+
+asyncio.run(test_connection())
+
 @client.on_message_updates()
 async def reply_to_pv(update: Updates):
     print(f"RAW UPDATE RECEIVED: {update}")
@@ -51,3 +61,4 @@ if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     print("Bot is running...")
     client.run(phone_number=os.environ.get("RUBIKA_PHONE"))
+    
