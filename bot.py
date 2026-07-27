@@ -53,6 +53,9 @@ BOT_PERSONA = f"""
 - اگه کسی از سن یا سال یا تولد پرسید، با توجه به سال {PERSIAN_YEAR} شمسی حساب کن.
 """
 
+# مدل سراسری
+model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
+
 # --- حافظه‌ها ---
 chat_histories = {}
 MAX_TURNS = 10
@@ -78,7 +81,6 @@ def safe_load_json(path, default):
             return json.load(f)
     except Exception as e:
         print(f"[LOAD ERROR] {path}: {e}")
-        # ایجاد بک‌آپ از فایل خراب
         try:
             backup = path + ".corrupt"
             shutil.copy(path, backup)
@@ -89,11 +91,10 @@ def safe_load_json(path, default):
 
 def safe_save_json(path, data):
     try:
-        # ابتدا در یک فایل موقت بنویسیم
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)  # atomic operation
+        os.replace(tmp, path)
         return True
     except Exception as e:
         print(f"[SAVE ERROR] {path}: {e}")
@@ -161,7 +162,6 @@ async def send_and_track(guid, text, reply_to=None):
         else:
             sent = await client.send_message(guid, text)
         
-        # استخراج message_id به روش‌های مختلف
         msg_id = None
         if hasattr(sent, 'message_id'):
             msg_id = sent.message_id
@@ -183,7 +183,6 @@ async def send_and_track(guid, text, reply_to=None):
         raise
 
 def get_reply_to_id(update):
-    """استخراج شناسه پیام مرجع از اشیاء update با نام‌های مختلف"""
     for attr in ['reply_to_message_id', 'reply_message_id', 'reply_to_msg_id']:
         val = getattr(update, attr, None)
         if val is not None:
@@ -191,7 +190,6 @@ def get_reply_to_id(update):
     return None
 
 def send_msg_sync(guid, text, reply_to=None):
-    """نسخه همگام برای استفاده از پنل فلاسک"""
     if not guid or not text:
         return False, "Empty"
     if main_loop is None:
@@ -212,7 +210,26 @@ def send_msg_sync(guid, text, reply_to=None):
     except Exception as e:
         return False, str(e)
 
-# ==================== FLASK APP ====================
+# ==================== تابع AI با retry ====================
+async def ask_gemini(prompt):
+    """درخواست به Gemini با تلاش مجدد روی کلیدهای مختلف"""
+    last_error = None
+    for attempt in range(len(api_keys) * 2):  # حداکثر ۲ بار برای هر کلید
+        key = pick_key()
+        try:
+            genai.configure(api_key=key)
+            temp_model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
+            chat = temp_model.start_chat(history=[])
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(executor, chat.send_message, prompt)
+            return response.text
+        except Exception as e:
+            last_error = e
+            print(f"[GEMINI] Attempt {attempt+1} failed with key ...{key[-4:]}: {e}")
+            await asyncio.sleep(1)
+    raise last_error or Exception("All Gemini attempts failed")
+
+    # ==================== FLASK APP ====================
 app = Flask(__name__)
 
 DASHBOARD_HTML = """
@@ -474,11 +491,11 @@ def api_chat():
     if not msg:
         return jsonify({"error": "Empty"}), 400
     try:
-        genai.configure(api_key=pick_key())
-        m = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
-        chat = m.start_chat(history=[])
-        res = chat.send_message(msg)
-        return jsonify({"reply": res.text})
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        reply = loop.run_until_complete(ask_gemini(msg))
+        loop.close()
+        return jsonify({"reply": reply})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -590,7 +607,6 @@ async def handle_messages(update: Updates):
             save_pending()
             knowledge_base[original["user_text"]] = user_text
             save_kb()
-            # ارسال تایید با تابع track
             await send_and_track(chat_guid, "✅ جوابت ذخیره شد توی دانش.")
             return
         return
@@ -618,7 +634,7 @@ async def handle_messages(update: Updates):
     if kb_answer and not is_age_question(user_text) and not is_age_question(kb_answer):
         try:
             await asyncio.sleep(random.uniform(1, 3))
-            sent = await send_and_track(chat_guid, kb_answer, reply_to=message_id)
+            await send_and_track(chat_guid, kb_answer, reply_to=message_id)
             print("[KB] Direct reply")
             return
         except Exception as e:
@@ -639,16 +655,7 @@ async def handle_messages(update: Updates):
         
         print(f"[AI] Sending prompt... ({len(full_prompt)} chars)")
         
-        genai.configure(api_key=pick_key())
-        m = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
-        chat = m.start_chat(history=[])
-        
-        def _ai_send():
-            return chat.send_message(full_prompt)
-        
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(executor, _ai_send)
-        ai_text = response.text
+        ai_text = await ask_gemini(full_prompt)
         print(f"[AI RAW] {ai_text[:120]}")
 
         waiting = False
@@ -677,7 +684,6 @@ async def handle_messages(update: Updates):
                 try:
                     notif = f"❓ سوال جدید\n🆔 {chat_guid}\n\n💬 {user_text}\n\n🤖 {ai_text}\n\n⬅️ ریپلای کن تا ذخیره کنم"
                     sent_notif = await send_and_track(OWNER_CONTROL_GROUP, notif)
-                    # جایگزینی id pending با id پیام نوتیف
                     nid = None
                     if hasattr(sent_notif, 'message_id'):
                         nid = sent_notif.message_id
@@ -694,18 +700,18 @@ async def handle_messages(update: Updates):
                     print(f"[NOTIF ERROR] {e}")
 
             try:
-                sent = await send_and_track(chat_guid, ai_text, reply_to=message_id)
+                await send_and_track(chat_guid, ai_text, reply_to=message_id)
                 print("[AI] Pending reply sent")
             except Exception as e:
                 print(f"[REPLY ERROR] {e}")
         else:
-            sent = await send_and_track(chat_guid, ai_text, reply_to=message_id)
+            await send_and_track(chat_guid, ai_text, reply_to=message_id)
             print("[AI] Direct reply sent")
 
     except Exception as e:
         print(f"[AI ERROR] {e}")
         try:
-            await send_and_track(chat_guid, "یه مشکلی پیش اومد، دوباره امتحان کن 😅", reply_to=message_id)
+            await send_and_track(chat_guid, "نتونستم جواب بدم، دوباره تلاش کن 🙏", reply_to=message_id)
         except:
             pass
 
