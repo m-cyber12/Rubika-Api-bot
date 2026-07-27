@@ -28,6 +28,9 @@ model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERS
 chat_histories = {}
 MAX_TURNS = 10  # تعداد رد و بدل‌هایی که به خاطر می‌سپاره
 
+# --- آیدی پیام‌هایی که خودِ ربات فرستاده، برای تشخیص Reply در گروه ---
+bot_sent_message_ids = set()
+
 # --- Restore Rubika session from env vars (split into 2 parts to avoid mobile paste truncation) ---
 SESSION_FILE = "my_rubika_account.rp"
 session_b64 = (os.environ.get("SESSION_B64_PART1", "") + os.environ.get("SESSION_B64_PART2", ""))
@@ -71,8 +74,10 @@ async def reply_to_pv(update: Updates):
         if author_guid and author_guid != chat_guid:
             return
     else:
-        if TRIGGER_WORD not in user_text:
-            return  # توی گروه/کانال، فقط وقتی کلمه‌ی کلیدی صدا زده بشه جواب بده
+        reply_to_id = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
+        is_reply_to_bot = reply_to_id is not None and reply_to_id in bot_sent_message_ids
+        if TRIGGER_WORD not in user_text and not is_reply_to_bot:
+            return  # توی گروه/کانال، فقط با کلمه‌ی کلیدی یا ریپلای به خودِ ربات جواب بده
         user_text = user_text.replace(TRIGGER_WORD, "", 1).strip()
         if not user_text:
             user_text = "سلام"  # اگه فقط خودِ کلمه‌ی کلیدی فرستاده شده بود
@@ -84,7 +89,12 @@ async def reply_to_pv(update: Updates):
         response = await chat.send_message_async(user_text)
         if len(chat.history) > MAX_TURNS * 2:
             chat_histories[chat_guid] = model.start_chat(history=chat.history[-MAX_TURNS * 2:])
-        await update.reply(response.text)
+        sent = await update.reply(response.text)
+        sent_id = getattr(sent, "message_id", None)
+        if sent_id:
+            bot_sent_message_ids.add(sent_id)
+            if len(bot_sent_message_ids) > 500:
+                bot_sent_message_ids.pop()
         print("Reply sent!")
     except Exception as e:
         print(f"Error: {e}")
