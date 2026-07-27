@@ -4,41 +4,20 @@ import threading
 import random
 import logging
 import json
-import re
-import shutil
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
 from rubpy import Client
 from rubpy.types import Updates
 import google.generativeai as genai
 from flask import Flask, request, jsonify, render_template_string
 
 logging.basicConfig(level=logging.INFO)
-
-# ==================== چند کلید API ====================
-api_keys_str = os.environ.get("GEMINI_API_KEYS", os.environ.get("GEMINI_API_KEY", ""))
-api_keys = [k.strip() for k in api_keys_str.split(",") if k.strip()]
-if not api_keys:
-    print("❌ ERROR: No Gemini API keys found!")
-    exit(1)
-
-def pick_key():
-    return random.choice(api_keys)
-
-genai.configure(api_key=pick_key())
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # ==================== تنظیمات ====================
 OWNER_NAME = "حسن"
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
+
 TRIGGER_WORD = "فرایدی"
-
-def get_persian_year():
-    now = datetime.now()
-    if now.month > 3 or (now.month == 3 and now.day >= 21):
-        return now.year - 621
-    return now.year - 622
-
-PERSIAN_YEAR = get_persian_year()
 
 BOT_PERSONA = f"""
 تو دستیار شخصی {OWNER_NAME} هستی که روی اکانت روبیکای اون فعالیت می‌کنی.
@@ -50,10 +29,8 @@ BOT_PERSONA = f"""
 - اگه سوالی درباره {OWNER_NAME} پرسیده شد و بلد بودی، مستقیم جواب بده.
 - اگه نمی‌دونی، حتماً بگو: "از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
 - هرگز حدس نزن.
-- اگه کسی از سن یا سال یا تولد پرسید، با توجه به سال {PERSIAN_YEAR} شمسی حساب کن.
 """
 
-# مدل سراسری
 model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
 
 # --- حافظه‌ها ---
@@ -62,39 +39,31 @@ MAX_TURNS = 10
 bot_sent_message_ids = set()
 
 KB_FILE = "knowledge_base.json"
-PENDING_FILE = "pending_replies.json"
-LOG_FILE = "chat_log.json"
-
 knowledge_base = {}
+
+PENDING_FILE = "pending_replies.json"
 pending_replies = {}
+
+LOG_FILE = "chat_log.json"
 chat_logs = []
 
 main_loop = None
-executor = ThreadPoolExecutor(max_workers=4)
 
-# ==================== توابع کمکی برای فایل ====================
-def safe_load_json(path, default):
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"[LOAD ERROR] {path}: {e}")
+# --- Load/Save ---
+def load_json(path, default):
+    if os.path.exists(path):
         try:
-            backup = path + ".corrupt"
-            shutil.copy(path, backup)
-            print(f"[BACKUP] Corrupt file saved as {backup}")
-        except:
-            pass
-        return default
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[LOAD ERROR] {path}: {e}")
+            return default
+    return default
 
-def safe_save_json(path, data):
+def save_json(path, data):
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
         return True
     except Exception as e:
         print(f"[SAVE ERROR] {path}: {e}")
@@ -102,27 +71,32 @@ def safe_save_json(path, data):
 
 def load_all():
     global knowledge_base, pending_replies, chat_logs
-    knowledge_base = safe_load_json(KB_FILE, {})
-    pending_raw = safe_load_json(PENDING_FILE, {})
+    knowledge_base = load_json(KB_FILE, {})
+    pending_raw = load_json(PENDING_FILE, {})
     pending_replies = {}
     for k, v in pending_raw.items():
         try:
             pending_replies[int(k)] = v
         except:
             pass
-    chat_logs = safe_load_json(LOG_FILE, [])
+    chat_logs = load_json(LOG_FILE, [])
     print(f"[STARTUP] KB={len(knowledge_base)}, Pending={len(pending_replies)}, Logs={len(chat_logs)}")
 
 def save_kb():
-    if safe_save_json(KB_FILE, knowledge_base):
-        print(f"[SAVE] KB: {len(knowledge_base)} items")
+    if save_json(KB_FILE, knowledge_base):
+        print(f"[SAVE] KB saved: {len(knowledge_base)} items")
+    else:
+        print(f"[SAVE FAIL] KB not saved!")
 
 def save_pending():
-    if safe_save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()}):
-        print(f"[SAVE] Pending: {len(pending_replies)} items")
+    ok = save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()})
+    if ok:
+        print(f"[SAVE] Pending saved: {len(pending_replies)} items")
+    else:
+        print(f"[SAVE FAIL] Pending not saved!")
 
 def save_logs():
-    safe_save_json(LOG_FILE, chat_logs)
+    save_json(LOG_FILE, chat_logs)
 
 # --- Restore Rubika session ---
 SESSION_FILE = "my_rubika_account.rp"
@@ -136,100 +110,52 @@ if not session_b64:
     part2 = os.environ.get("session_b64_part2", "")
     session_b64 = part1 + part2
     if session_b64:
-        print("[SESSION] Found lowercase session vars")
+        print("[SESSION] Found lowercase session_b64_part1/part2")
 
 if session_b64 and not os.path.exists(SESSION_FILE):
     import base64
     try:
         with open(SESSION_FILE, "wb") as f:
             f.write(base64.b64decode(session_b64))
-        print(f"[SESSION] Restored: {os.path.getsize(SESSION_FILE)} bytes")
+        print(f"[SESSION] Restored {SESSION_FILE}: {os.path.getsize(SESSION_FILE)} bytes")
     except Exception as e:
         print(f"[SESSION] Restore error: {e}")
 elif os.path.exists(SESSION_FILE):
-    print(f"[SESSION] Exists: {os.path.getsize(SESSION_FILE)} bytes")
+    print(f"[SESSION] File exists: {os.path.getsize(SESSION_FILE)} bytes")
 else:
-    print("[SESSION] No session vars!")
+    print("[SESSION] No session env vars found!")
 
 client = Client(name="my_rubika_account")
 
-# ==================== توابع کمکی برای ارسال و شناسایی ریپلای ====================
-async def send_and_track(guid, text, reply_to=None):
-    """ارسال پیام و ثبت message_id در set برای تشخیص ریپلای"""
-    try:
-        if reply_to:
-            sent = await client.send_message(guid, text, reply_to_message_id=reply_to)
-        else:
-            sent = await client.send_message(guid, text)
-        
-        msg_id = None
-        if hasattr(sent, 'message_id'):
-            msg_id = sent.message_id
-        elif isinstance(sent, dict) and 'message_id' in sent:
-            msg_id = sent['message_id']
-        elif hasattr(sent, 'id'):
-            msg_id = sent.id
-        elif hasattr(sent, 'Message') and hasattr(sent.Message, 'message_id'):
-            msg_id = sent.Message.message_id
-
-        if msg_id:
-            bot_sent_message_ids.add(msg_id)
-            print(f"[TRACK] Added message_id {msg_id} for {guid}")
-        else:
-            print(f"[TRACK] Could not extract message_id from {sent}")
-        return sent
-    except Exception as e:
-        print(f"[SEND ERROR] {e}")
-        raise
-
-def get_reply_to_id(update):
-    for attr in ['reply_to_message_id', 'reply_message_id', 'reply_to_msg_id']:
-        val = getattr(update, attr, None)
-        if val is not None:
-            return val
-    return None
-
+# ==================== HELPER ====================
 def send_msg_sync(guid, text, reply_to=None):
     if not guid or not text:
-        return False, "Empty"
+        return False, "Empty guid or text"
     if main_loop is None:
-        return False, "No loop"
+        return False, "Bot not ready yet"
     
     async def _send():
         try:
-            return await send_and_track(guid, text, reply_to)
+            if reply_to:
+                result = await client.send_message(guid, text, reply_to_message_id=reply_to)
+            else:
+                result = await client.send_message(guid, text)
+            return True, result
         except Exception as e:
-            return None
+            print(f"[SEND FAIL] {guid}: {e}")
+            try:
+                result = await client.send_message(guid, text)
+                return True, result
+            except Exception as e2:
+                return False, str(e2)
     
     try:
         future = asyncio.run_coroutine_threadsafe(_send(), main_loop)
-        result = future.result(timeout=15)
-        if result:
-            return True, "OK"
-        return False, "Send failed"
+        return future.result(timeout=15)
     except Exception as e:
         return False, str(e)
 
-# ==================== تابع AI با retry ====================
-async def ask_gemini(prompt):
-    """درخواست به Gemini با تلاش مجدد روی کلیدهای مختلف"""
-    last_error = None
-    for attempt in range(len(api_keys) * 2):  # حداکثر ۲ بار برای هر کلید
-        key = pick_key()
-        try:
-            genai.configure(api_key=key)
-            temp_model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
-            chat = temp_model.start_chat(history=[])
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(executor, chat.send_message, prompt)
-            return response.text
-        except Exception as e:
-            last_error = e
-            print(f"[GEMINI] Attempt {attempt+1} failed with key ...{key[-4:]}: {e}")
-            await asyncio.sleep(1)
-    raise last_error or Exception("All Gemini attempts failed")
-
-    # ==================== FLASK APP ====================
+# ==================== FLASK APP ====================
 app = Flask(__name__)
 
 DASHBOARD_HTML = """
@@ -323,7 +249,7 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 </div>
 
 <script>
-console.log('JS loaded - v8');
+console.log('JS loaded - v5');
 
 function esc(t){const d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
 
@@ -415,12 +341,7 @@ async function ansPen(id,text){
   try{
     const r=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:parseInt(id),text:text})});
     const d=await r.json();
-    if(d.ok){
-      loadPending(); updateStats(); 
-      alert(d.message || '✅ ذخیره شد');
-    }else{
-      alert(d.error || 'خطا');
-    }
+    if(d.ok){loadPending();updateStats();}else alert(d.error||'خطا');
   }catch(e){alert('❌ خطا');}
 }
 async function loadPending(){
@@ -491,11 +412,9 @@ def api_chat():
     if not msg:
         return jsonify({"error": "Empty"}), 400
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        reply = loop.run_until_complete(ask_gemini(msg))
-        loop.close()
-        return jsonify({"reply": reply})
+        chat = model.start_chat(history=[])
+        res = chat.send_message(msg)
+        return jsonify({"reply": res.text})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -545,28 +464,22 @@ def api_answer():
     save_pending()
     knowledge_base[original["user_text"]] = text
     save_kb()
-    return jsonify({
-        "ok": True,
-        "message": f"✅ ذخیره شد!\n\nسوال: {original['user_text']}\nجواب: {text}\n\nAI از دفعه بعد استفاده می‌کنه."
-    })
+    ok, result = send_msg_sync(original["chat_guid"], text, reply_to=original.get("message_id"))
+    if ok:
+        return jsonify({"ok": True})
+    pending_replies[pid] = original
+    save_pending()
+    return jsonify({"error": result}), 500
 
 @app.route("/api/logs")
 def api_logs():
     return jsonify({"logs": chat_logs})
 
-    # ==================== قسمت ۲: ربات روبیکا ====================
+# ==================== قسمت ۲: ربات روبیکا ====================
 def get_chat_session(chat_guid):
     if chat_guid not in chat_histories:
         chat_histories[chat_guid] = model.start_chat(history=[])
     return chat_histories[chat_guid]
-
-def is_age_question(text):
-    if not text:
-        return False
-    return any(kw in text for kw in ["چند سال", "سن", "سالش", "عمر", "قدیمی", "تولد", "متولد", "چندسال"])
-
-def is_about_owner(text):
-    return OWNER_NAME in text if text else False
 
 @client.on_message_updates()
 async def handle_messages(update: Updates):
@@ -579,6 +492,7 @@ async def handle_messages(update: Updates):
     author_guid = getattr(update, "author_guid", "") or ""
     raw_msg_id = getattr(update, "message_id", None)
     
+    # تبدیل message_id به int برای JSON-safe بودن
     try:
         message_id = int(raw_msg_id) if raw_msg_id is not None else None
     except:
@@ -601,13 +515,28 @@ async def handle_messages(update: Updates):
 
     # ۱. گروه کنترل (اگه ست شده باشه)
     if OWNER_CONTROL_GROUP and chat_guid == OWNER_CONTROL_GROUP:
-        reply_to = get_reply_to_id(update)
+        reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
         if reply_to and reply_to in pending_replies:
             original = pending_replies.pop(reply_to)
             save_pending()
             knowledge_base[original["user_text"]] = user_text
             save_kb()
-            await send_and_track(chat_guid, "✅ جوابت ذخیره شد توی دانش.")
+            try:
+                await client.send_message(
+                    original["chat_guid"], 
+                    user_text, 
+                    reply_to_message_id=original.get("message_id")
+                )
+                await update.reply("✅ جوابت ارسال و ذخیره شد!")
+            except Exception as e:
+                print(f"[CONTROL ERROR] {e}")
+                try:
+                    await client.send_message(original["chat_guid"], user_text)
+                    await update.reply("✅ ارسال شد (بدون ریپلای)")
+                except Exception as e2:
+                    pending_replies[reply_to] = original
+                    save_pending()
+                    await update.reply(f"❌ خطا: {e2}")
             return
         return
 
@@ -617,7 +546,7 @@ async def handle_messages(update: Updates):
         if author_guid and author_guid != chat_guid:
             return
     else:
-        reply_to = get_reply_to_id(update)
+        reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
         is_reply_to_bot = reply_to is not None and reply_to in bot_sent_message_ids
         if TRIGGER_WORD not in user_text and not is_reply_to_bot:
             return
@@ -625,24 +554,25 @@ async def handle_messages(update: Updates):
         if not user_text:
             user_text = "سلام"
 
-    print(f"\n[MSG] {chat_guid} (pv={is_private}): {user_text[:80]}")
-    print(f"[DEBUG] bot_sent_message_ids = {bot_sent_message_ids}")
+    print(f"[MSG] {chat_guid} (pv={is_private}): {user_text[:80]}")
 
     # ۳. بررسی Knowledge Base
-    kb_answer = knowledge_base.get(user_text)
-    
-    if kb_answer and not is_age_question(user_text) and not is_age_question(kb_answer):
+    if user_text in knowledge_base:
         try:
             await asyncio.sleep(random.uniform(1, 3))
-            await send_and_track(chat_guid, kb_answer, reply_to=message_id)
-            print("[KB] Direct reply")
-            return
+            sent = await update.reply(knowledge_base[user_text])
+            sid = getattr(sent, "message_id", None)
+            if sid:
+                bot_sent_message_ids.add(sid)
+            print("[KB] Replied from knowledge")
         except Exception as e:
             print(f"[KB ERROR] {e}")
+        return
 
     # ۴. AI
     try:
-        await asyncio.sleep(random.uniform(2, 4))
+        await asyncio.sleep(random.uniform(3, 6))
+        chat = get_chat_session(chat_guid)
         
         kb_ctx = ""
         if knowledge_base:
@@ -650,70 +580,73 @@ async def handle_messages(update: Updates):
             for q, a in list(knowledge_base.items())[-5:]:
                 kb_ctx += f"- {q}: {a}\n"
         
-        date_ctx = f"\nسال شمسی الان: {PERSIAN_YEAR}\n"
-        full_prompt = user_text + date_ctx + kb_ctx
-        
-        print(f"[AI] Sending prompt... ({len(full_prompt)} chars)")
-        
-        ai_text = await ask_gemini(full_prompt)
-        print(f"[AI RAW] {ai_text[:120]}")
+        response = await chat.send_message_async(user_text + kb_ctx)
+        ai_text = response.text
 
-        waiting = False
-        if any(re.search(p, ai_text) for p in [r"می[‌\s]?پرسم", r"بپرسم", r"نمی[‌\s]?دانم", r"نمی[‌\s]?دونم", r"نمیدونم", r"اطلاع[ات\s]+ندارم", r"مطمئن\s+نیستم"]):
-            waiting = True
-            print("[AI] Detected waiting phrase")
-        
-        if not waiting and is_about_owner(user_text) and not kb_answer:
-            waiting = True
-            ai_text = f"از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
-            print("[FALLBACK] Owner question, no KB -> pending")
+        waiting = any(p in ai_text for p in ["می‌پرسم", "ازش می‌پرسم", "بپرسم", "نمی‌دونم", "نمی‌دانم", "نمی دونم", "اطلاع ندارم"])
+        print(f"[AI] waiting={waiting} | {ai_text[:100]}")
 
         if waiting:
+            # ثبت توی pending
             pending_id = random.randint(100000, 999999)
-            pending_replies[pending_id] = {
+            pending_item = {
                 "chat_guid": chat_guid,
                 "user_text": user_text,
                 "author_guid": author_guid,
                 "message_id": message_id,
                 "time": datetime.now().strftime("%H:%M:%S")
             }
+            pending_replies[pending_id] = pending_item
+            print(f"[PENDING] Adding id={pending_id}, msg_id={message_id}")
             save_pending()
-            print(f"[PENDING] id={pending_id}, total={len(pending_replies)}")
+            print(f"[PENDING] Saved to file. Total pending: {len(pending_replies)}")
 
+            # نوتیف گروه کنترل (اگه ست شده باشه)
             if OWNER_CONTROL_GROUP:
                 try:
-                    notif = f"❓ سوال جدید\n🆔 {chat_guid}\n\n💬 {user_text}\n\n🤖 {ai_text}\n\n⬅️ ریپلای کن تا ذخیره کنم"
-                    sent_notif = await send_and_track(OWNER_CONTROL_GROUP, notif)
-                    nid = None
-                    if hasattr(sent_notif, 'message_id'):
-                        nid = sent_notif.message_id
-                    elif isinstance(sent_notif, dict) and 'message_id' in sent_notif:
-                        nid = sent_notif['message_id']
-                    elif hasattr(sent_notif, 'id'):
-                        nid = sent_notif.id
+                    notif = (
+                        f"❓ سوال جدید\n"
+                        f"🆔 چت: `{chat_guid}`\n\n"
+                        f"💬 {user_text}\n\n"
+                        f"🤖 AI: {ai_text}\n\n"
+                        f"⬅️ ریپلای کن تا جواب بفرستم"
+                    )
+                    sent_notif = await client.send_message(OWNER_CONTROL_GROUP, notif)
+                    nid = getattr(sent_notif, "message_id", None)
                     if nid:
                         pending_replies[nid] = pending_replies.pop(pending_id)
-                        pending_replies[nid]["message_id"] = message_id
+                        try:
+                            pending_replies[nid]["message_id"] = message_id
+                        except:
+                            pass
                         save_pending()
-                        print(f"[PENDING] Mapped to notification id {nid}")
+                        print(f"[NOTIF] Sent to control group, nid={nid}")
                 except Exception as e:
                     print(f"[NOTIF ERROR] {e}")
 
+            # پیام "منتظر" به کاربر
             try:
-                await send_and_track(chat_guid, ai_text, reply_to=message_id)
-                print("[AI] Pending reply sent")
+                sent = await update.reply(ai_text)
+                sid = getattr(sent, "message_id", None)
+                if sid:
+                    bot_sent_message_ids.add(sid)
+                print("[REPLY] Wait message sent to user")
             except Exception as e:
                 print(f"[REPLY ERROR] {e}")
         else:
-            await send_and_track(chat_guid, ai_text, reply_to=message_id)
+            sent = await update.reply(ai_text)
+            sid = getattr(sent, "message_id", None)
+            if sid:
+                bot_sent_message_ids.add(sid)
+                if len(bot_sent_message_ids) > 500:
+                    bot_sent_message_ids.pop()
             print("[AI] Direct reply sent")
 
+        if len(chat.history) > MAX_TURNS * 2:
+            chat_histories[chat_guid] = model.start_chat(history=chat.history[-MAX_TURNS * 2:])
+
     except Exception as e:
-        print(f"[AI ERROR] {e}")
-        try:
-            await send_and_track(chat_guid, "نتونستم جواب بدم، دوباره تلاش کن 🙏", reply_to=message_id)
-        except:
-            pass
+        print(f"[ERROR] {e}")
 
 # ==================== اجرا ====================
 if __name__ == "__main__":
@@ -727,15 +660,15 @@ if __name__ == "__main__":
     print("=" * 50)
     print("🚀 Bot + Dashboard running")
     print(f"📊 URL: https://your-app.onrender.com/")
-    print(f"📬 Control Group: {OWNER_CONTROL_GROUP or 'OFF'}")
+    print(f"📬 Control Group: {OWNER_CONTROL_GROUP or 'OFF (فقط پنل)'}")
     print(f"🧠 KB: {len(knowledge_base)} | ⏳ Pending: {len(pending_replies)}")
-    print(f"🔑 API Keys: {len(api_keys)}")
     print("=" * 50)
     
     RUBIKA_PHONE = os.environ.get("RUBIKA_PHONE") or os.environ.get("rubika_phone")
     if RUBIKA_PHONE:
-        print(f"📱 Phone: {RUBIKA_PHONE[:6]}...")
+        print(f"📱 Using phone: {RUBIKA_PHONE[:6]}...")
         client.run(phone_number=RUBIKA_PHONE)
     else:
-        print("📱 Session auth...")
+        print("📱 No phone number set, trying session auth...")
         client.run()
+        
