@@ -611,6 +611,13 @@ async def handle_messages(update: Updates):
 if __name__ == "__main__":
     load_all()
     
+    # چک کردن شماره تلفن
+    RUBIKA_PHONE = os.environ.get("RUBIKA_PHONE", "").strip()
+    if not RUBIKA_PHONE:
+        print("❌ ERROR: RUBIKA_PHONE is not set in environment variables!")
+        print("Please set RUBIKA_PHONE in Render dashboard.")
+        exit(1)
+    
     def run_web():
         port = int(os.environ.get("PORT", 10000))
         app.run(host="0.0.0.0", port=port, threaded=True)
@@ -622,5 +629,6 @@ if __name__ == "__main__":
     print(f"📬 Control Group: {OWNER_CONTROL_GROUP or 'OFF (فقط پنل)'}")
     print(f"🧠 KB: {len(knowledge_base)} | ⏳ Pending: {len(pending_replies)}")
     print("=" * 50)
-    client.run(phone_number=os.environ.get("RUBIKA_PHONE"))
+    
+    client.run(phone_number=RUBIKA_PHONE)
     
