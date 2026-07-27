@@ -15,6 +15,9 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # ==================== تنظیمات ====================
 OWNER_NAME = "آقای حسن‌پور"
+
+# این اختیاریه. اگه خالی باشه، فقط از پنل وب سوالات رو می‌بینی
+# اگه GUID گروه روبیکات رو اینجا بذاری، اونجا هم نوتیف میاد
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
 
 BOT_PERSONA = f"""
@@ -28,7 +31,7 @@ BOT_PERSONA = f"""
 - هرگز حدس نزن.
 """
 
-TRIGGER_WORD = "فرایدی"
+TRIGGER_WORD = "دستیار"
 model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
 
 # --- حافظه‌ها ---
@@ -91,30 +94,25 @@ if session_b64 and not os.path.exists(SESSION_FILE):
 
 client = Client(name="my_rubika_account")
 
-# ==================== HELPER: ارسال پیام async از توی Flask sync ====================
+# ==================== HELPER ====================
 def send_msg_sync(guid, text):
-    """این تابع رو از API های sync صدا می‌زنیم"""
     if not guid or not text:
-        return False, "Empty guid or text"
+        return False, "Empty"
     async def _send():
         try:
             result = await client.send_message(guid, text)
-            print(f"[SEND OK] -> {guid}: {text[:50]}")
             return True, result
         except Exception as e:
-            print(f"[SEND FAIL] -> {guid}: {e}")
+            print(f"[SEND FAIL] {guid}: {e}")
             return False, str(e)
-    
     loop = asyncio.get_event_loop()
     if loop.is_running():
         future = asyncio.run_coroutine_threadsafe(_send(), loop)
         try:
-            ok, res = future.result(timeout=15)
-            return ok, res
+            return future.result(timeout=15)
         except Exception as e:
             return False, str(e)
-    else:
-        return False, "Event loop not running"
+    return False, "Loop not running"
 
 # ==================== FLASK APP ====================
 app = Flask(__name__)
@@ -128,41 +126,42 @@ DASHBOARD_HTML = """
 <title>دستیار روبیکا</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Tahoma,'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;padding:15px}
+body{font-family:Tahoma,'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;padding:12px}
 .container{max-width:900px;margin:0 auto}
-h1{color:#58a6ff;text-align:center;margin-bottom:15px;font-size:22px}
-.stats{display:flex;gap:10px;margin-bottom:15px;justify-content:center;flex-wrap:wrap}
-.stat{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px 20px;text-align:center;min-width:100px}
-.stat .num{font-size:26px;font-weight:bold;color:#3fb950}
-.stat .label{font-size:12px;color:#8b949e;margin-top:4px}
-.tabs{display:flex;gap:8px;margin-bottom:15px;flex-wrap:wrap;justify-content:center}
-.tab{background:#21262d;border:1px solid #30363d;border-radius:8px;padding:10px 16px;cursor:pointer;font-size:14px;transition:.2s}
+h1{color:#58a6ff;text-align:center;margin-bottom:12px;font-size:20px}
+.stats{display:flex;gap:10px;margin-bottom:12px;justify-content:center;flex-wrap:wrap}
+.stat{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:10px 18px;text-align:center;min-width:90px}
+.stat .num{font-size:24px;font-weight:bold;color:#3fb950}
+.stat .label{font-size:11px;color:#8b949e;margin-top:3px}
+.tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;justify-content:center}
+.tab{background:#21262d;border:1px solid #30363d;border-radius:8px;padding:9px 14px;cursor:pointer;font-size:13px;transition:.2s}
 .tab:hover{background:#30363d}
 .tab.active{background:#238636;color:#fff;border-color:#238636;font-weight:bold}
-.panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:15px;display:none}
+.panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:14px;display:none}
 .panel.active{display:block}
-input,textarea{width:100%;padding:10px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9;margin-bottom:10px;font-family:inherit;font-size:14px}
-textarea{min-height:80px;resize:vertical}
-button{background:#238636;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:14px}
+input,textarea{width:100%;padding:10px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9;margin-bottom:8px;font-family:inherit;font-size:14px}
+textarea{min-height:70px;resize:vertical}
+button{background:#238636;color:#fff;border:none;padding:9px 18px;border-radius:6px;cursor:pointer;font-size:14px}
 button:hover{background:#2ea043}
 .btn-red{background:#da3633}
 .btn-red:hover{background:#f85149}
-.msg-box{height:250px;overflow-y:auto;border:1px solid #30363d;border-radius:6px;padding:10px;margin-bottom:10px;background:#0d1117}
-.msg{padding:8px 10px;border-radius:6px;margin-bottom:6px;font-size:14px}
-.msg-u{background:#1f6feb20;border-right:3px solid #58a6ff}
-.msg-a{background:#23863620;border-right:3px solid #3fb950}
-.kb-item,.pending-item{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;margin-bottom:8px;display:flex;gap:10px;align-items:flex-start}
-.kb-item div,.pending-item div{flex:1;font-size:14px}
-.pending-item input{flex:1;margin:0}
+.msg-box{height:220px;overflow-y:auto;border:1px solid #30363d;border-radius:6px;padding:10px;margin-bottom:8px;background:#0d1117}
+.msg{padding:7px 9px;border-radius:6px;margin-bottom:5px;font-size:13px;line-height:1.5}
+.msg-u{background:#1f6feb18;border-right:3px solid #58a6ff}
+.msg-a{background:#23863618;border-right:3px solid #3fb950}
+.kb-item,.pending-item{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;margin-bottom:8px}
+.kb-item{display:flex;gap:10px;align-items:flex-start}
+.kb-item div,.pending-item div{flex:1;font-size:13px}
+.pending-row{display:flex;gap:8px;margin-bottom:10px;align-items:center}
+.pending-row input{flex:1;margin:0}
 .small{color:#8b949e;font-size:12px}
 hr{border:0;border-top:1px solid #30363d;margin:10px 0}
-#chat-input-wrap{display:flex;gap:8px}
-#chat-input-wrap input{flex:1;margin:0}
+.empty{text-align:center;color:#8b949e;padding:20px;font-size:13px}
 </style>
 </head>
 <body>
 <div class="container">
-<h1>🤖 دستیار روبیکا - کنترل پنل</h1>
+<h1>🤖 دستیار روبیکا</h1>
 
 <div class="stats">
   <div class="stat"><div class="num" id="st-kb">0</div><div class="label">دانش</div></div>
@@ -171,32 +170,32 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 </div>
 
 <div class="tabs">
-  <div class="tab active" onclick="showTab('chat',this)">💬 چت با AI</div>
-  <div class="tab" onclick="showTab('send',this)">📨 ارسال پیام</div>
-  <div class="tab" onclick="showTab('kb',this)">📚 دانش</div>
-  <div class="tab" onclick="showTab('pending',this)">⏳ سوالات</div>
-  <div class="tab" onclick="showTab('logs',this)">📋 لاگ</div>
+  <div class="tab active" id="tab-btn-chat" onclick="switchTab('chat')">💬 چت با AI</div>
+  <div class="tab" id="tab-btn-send" onclick="switchTab('send')">📨 ارسال پیام</div>
+  <div class="tab" id="tab-btn-kb" onclick="switchTab('kb')">📚 دانش</div>
+  <div class="tab" id="tab-btn-pending" onclick="switchTab('pending')">⏳ سوالات</div>
+  <div class="tab" id="tab-btn-logs" onclick="switchTab('logs')">📋 لاگ</div>
 </div>
 
 <!-- چت -->
-<div id="p-chat" class="panel active">
+<div id="panel-chat" class="panel active">
   <div class="msg-box" id="chat-box"></div>
-  <div id="chat-input-wrap">
-    <input type="text" id="chat-in" placeholder="پیامت رو بنویس..." onkeydown="if(event.key==='Enter') sendChat()">
+  <div style="display:flex;gap:8px">
+    <input type="text" id="chat-in" placeholder="پیامت رو بنویس..." onkeydown="if(event.key==='Enter') sendChat()" style="flex:1;margin:0">
     <button onclick="sendChat()">ارسال</button>
   </div>
 </div>
 
 <!-- ارسال -->
-<div id="p-send" class="panel">
+<div id="panel-send" class="panel">
   <input type="text" id="s-guid" placeholder="GUID چت (مثلاً u0...)">
   <textarea id="s-text" placeholder="متن پیام..."></textarea>
   <button onclick="sendMsg()">📤 ارسال</button>
-  <p class="small">GUID رو از تب لاگ می‌تونی پیدا کنی</p>
+  <p class="small">GUID رو از تب لاگ پیدا کن</p>
 </div>
 
 <!-- دانش -->
-<div id="p-kb" class="panel">
+<div id="panel-kb" class="panel">
   <input type="text" id="k-q" placeholder="سوال (مثلاً: شغلت چیه؟)">
   <textarea id="k-a" placeholder="جواب..."></textarea>
   <button onclick="addKB()">➕ ذخیره</button>
@@ -205,23 +204,23 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 </div>
 
 <!-- سوالات -->
-<div id="p-pending" class="panel">
+<div id="panel-pending" class="panel">
   <div id="pending-list"></div>
 </div>
 
 <!-- لاگ -->
-<div id="p-logs" class="panel">
-  <div id="logs-list" style="max-height:400px;overflow-y:auto;"></div>
+<div id="panel-logs" class="panel">
+  <div id="logs-list" style="max-height:400px;overflow-y:auto"></div>
 </div>
 
 </div>
 
 <script>
-function showTab(name,el){
+function switchTab(name){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.getElementById('p-'+name).classList.add('active');
-  el.classList.add('active');
+  document.getElementById('panel-'+name).classList.add('active');
+  document.getElementById('tab-btn-'+name).classList.add('active');
   if(name==='kb') loadKB();
   if(name==='pending') loadPending();
   if(name==='logs') loadLogs();
@@ -234,7 +233,7 @@ async function sendChat(){
   addChat('u',t);
   const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:t})});
   const d=await r.json();
-  addChat('a',d.reply||d.error);
+  addChat('a',d.reply||d.error||'خطا');
 }
 function addChat(role,text){
   const b=document.getElementById('chat-box');
@@ -250,13 +249,13 @@ async function sendMsg(){
   if(!g||!t) return alert('GUID و متن رو پر کن!');
   const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guid:g,text:t})});
   const d=await r.json();
-  alert(d.ok?'✅ ارسال شد!':'❌ '+d.error);
+  alert(d.ok?'✅ ارسال شد!':'❌ '+ (d.error||'خطا'));
 }
 
 async function addKB(){
   const q=document.getElementById('k-q').value.trim();
   const a=document.getElementById('k-a').value.trim();
-  if(!q||!a) return alert('سوال و جواب!');
+  if(!q||!a) return alert('سوال و جواب رو پر کن!');
   await fetch('/api/kb',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q,a})});
   document.getElementById('k-q').value='';
   document.getElementById('k-a').value='';
@@ -269,35 +268,40 @@ async function delKB(q){
 }
 async function loadKB(){
   const r=await fetch('/api/kb'); const d=await r.json();
-  const l=document.getElementById('kb-list'); l.innerHTML='';
-  for(const [q,a] of Object.entries(d.kb||{})){
+  const l=document.getElementById('kb-list');
+  const items=Object.entries(d.kb||{});
+  if(items.length===0){l.innerHTML='<div class="empty">دانشی ذخیره نشده</div>';return;}
+  l.innerHTML='';
+  items.forEach(([q,a])=>{
     l.innerHTML+='<div class="kb-item"><div><b>س:</b> '+esc(q)+'<br><b>ج:</b> '+esc(a)+'</div><button class="btn-red" onclick=\"delKB(\''+esc(q).replace(/'/g,"\\'")+'\')\">🗑</button></div>';
-  }
+  });
 }
 
 async function loadPending(){
   const r=await fetch('/api/pending'); const d=await r.json();
-  const l=document.getElementById('pending-list'); l.innerHTML='';
-  const p=d.pending||{};
-  if(Object.keys(p).length===0){l.innerHTML='<p class="small" style="text-align:center">چیزی در انتظار نیست</p>';return;}
-  for(const [id,info] of Object.entries(p)){
-    l.innerHTML+='<div class="pending-item"><div><b>#'+id+'</b><br>'+esc(info.user_text)+'<br><span class="small">'+info.chat_guid+'</span></div></div>'+
-    '<div style="display:flex;gap:8px;margin-bottom:12px;"><input type="text" id="ans-'+id+'" placeholder="جوابت رو بنویس..." onkeydown="if(event.key===\'Enter\') ansPen('+id+')"><button onclick="ansPen('+id+')">✅</button></div>';
-  }
+  const l=document.getElementById('pending-list');
+  const items=Object.entries(d.pending||{});
+  if(items.length===0){l.innerHTML='<div class="empty">سوالی در انتظار نیست</div>';return;}
+  l.innerHTML='';
+  items.forEach(([id,info])=>{
+    l.innerHTML+='<div class="pending-item"><div><b>#'+id+'</b> &nbsp; <span class="small">'+esc(info.chat_guid)+'</span><br>'+esc(info.user_text)+'</div></div>'+
+    '<div class="pending-row"><input type="text" id="ans-'+id+'" placeholder="جوابت رو بنویس..." onkeydown="if(event.key===\'Enter\') ansPen('+id+')"><button onclick="ansPen('+id+')">✅</button></div>';
+  });
 }
 async function ansPen(id){
   const inp=document.getElementById('ans-'+id);
   const t=inp.value.trim(); if(!t) return;
   const r=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:parseInt(id),text:t})});
   const d=await r.json();
-  if(d.ok){loadPending();updateStats();}else alert(d.error);
+  if(d.ok){loadPending();updateStats();}else alert(d.error||'خطا');
 }
 
 async function loadLogs(){
   const r=await fetch('/api/logs'); const d=await r.json();
-  const l=document.getElementById('logs-list'); l.innerHTML='';
+  const l=document.getElementById('logs-list');
   const logs=(d.logs||[]).slice().reverse();
-  if(logs.length===0){l.innerHTML='<p class="small" style="text-align:center">لاگ خالیه</p>';return;}
+  if(logs.length===0){l.innerHTML='<div class="empty">لاگ خالیه</div>';return;}
+  l.innerHTML='';
   logs.forEach(log=>{
     l.innerHTML+='<div class="msg msg-u"><span class="small">'+esc(log.time)+' | '+esc(log.guid)+'</span><br><b>'+esc(log.from)+':</b> '+esc(log.text)+'</div>';
   });
@@ -309,7 +313,7 @@ async function updateStats(){
   document.getElementById('st-pen').textContent=d.pen;
   document.getElementById('st-log').textContent=d.today;
 }
-function esc(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML;}
+function esc(t){const d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
 
 updateStats();
 setInterval(updateStats,8000);
@@ -409,7 +413,6 @@ async def handle_messages(update: Updates):
     chat_guid = getattr(update, "object_guid", "") or ""
     user_text = getattr(update, "text", None)
     author_guid = getattr(update, "author_guid", "") or ""
-    msg_id = getattr(update, "message_id", None)
     
     if not user_text:
         return
@@ -426,8 +429,8 @@ async def handle_messages(update: Updates):
         chat_logs.pop(0)
     save_logs()
 
-    # ۱. گروه کنترل - ریپلای به نوتیفیکیشن
-    if chat_guid == OWNER_CONTROL_GROUP and OWNER_CONTROL_GROUP:
+    # ۱. گروه کنترل (اگه ست شده باشه)
+    if OWNER_CONTROL_GROUP and chat_guid == OWNER_CONTROL_GROUP:
         reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
         if reply_to and reply_to in pending_replies:
             original = pending_replies.pop(reply_to)
@@ -437,12 +440,10 @@ async def handle_messages(update: Updates):
             try:
                 await client.send_message(original["chat_guid"], user_text)
                 await update.reply("✅ جوابت ارسال و ذخیره شد!")
-                print(f"[CONTROL] Owner reply sent to {original['chat_guid']}")
             except Exception as e:
-                print(f"[CONTROL] Error: {e}")
+                print(f"[CONTROL ERROR] {e}")
                 pending_replies[reply_to] = original
                 save_pending()
-                await update.reply(f"❌ خطا: {e}")
             return
         return
 
@@ -462,7 +463,7 @@ async def handle_messages(update: Updates):
 
     print(f"[MSG] {chat_guid} (pv={is_private}): {user_text[:80]}")
 
-    # ۳. بررسی Knowledge Base (دقیق)
+    # ۳. بررسی Knowledge Base
     if user_text in knowledge_base:
         try:
             await asyncio.sleep(random.uniform(1, 3))
@@ -470,9 +471,9 @@ async def handle_messages(update: Updates):
             sid = getattr(sent, "message_id", None)
             if sid:
                 bot_sent_message_ids.add(sid)
-            print(f"[KB] Replied from knowledge base")
+            print("[KB] Replied from knowledge")
         except Exception as e:
-            print(f"[KB] Error: {e}")
+            print(f"[KB ERROR] {e}")
         return
 
     # ۴. AI
@@ -482,7 +483,7 @@ async def handle_messages(update: Updates):
         
         kb_ctx = ""
         if knowledge_base:
-            kb_ctx = "\nاطلاعات شناخته شده درباره صاحب اکانت:\n"
+            kb_ctx = "\nاطلاعات شناخته شده:\n"
             for q, a in list(knowledge_base.items())[-5:]:
                 kb_ctx += f"- {q}: {a}\n"
         
@@ -490,42 +491,47 @@ async def handle_messages(update: Updates):
         ai_text = response.text
 
         waiting = any(p in ai_text for p in ["می‌پرسم", "ازش می‌پرسم", "بپرسم", "نمی‌دونم", "نمی‌دانم", "نمی دونم", "اطلاع ندارم"])
-        print(f"[AI] Waiting={waiting} | Reply: {ai_text[:100]}")
+        print(f"[AI] waiting={waiting} | {ai_text[:100]}")
 
-        if waiting and OWNER_CONTROL_GROUP:
-            # نوتیفیکیشن به گروه کنترل
-            notif = (
-                f"❓ سوال جدید درباره تو\n"
-                f"🆔 چت: `{chat_guid}`\n"
-                f"👤 فرستنده: {author_guid or 'unknown'}\n\n"
-                f"💬 سوال:\n{user_text}\n\n"
-                f"🤖 پیشنهاد AI:\n{ai_text}\n\n"
-                f"⬅️ برای جواب دادن، به این پیام ریپلای کن."
-            )
-            try:
-                sent_notif = await client.send_message(OWNER_CONTROL_GROUP, notif)
-                nid = getattr(sent_notif, "message_id", None)
-                if nid:
-                    pending_replies[nid] = {
-                        "chat_guid": chat_guid,
-                        "user_text": user_text,
-                        "author_guid": author_guid
-                    }
-                    save_pending()
-                    print(f"[PENDING] Saved pending id={nid}")
-                else:
-                    print("[PENDING] No message_id returned!")
-            except Exception as e:
-                print(f"[PENDING] Failed to send notification: {e}")
-            
-            # پیام موقت به کاربر
+        if waiting:
+            # ثبت توی pending (برای پنل وب)
+            pending_id = random.randint(100000, 999999)
+            pending_replies[pending_id] = {
+                "chat_guid": chat_guid,
+                "user_text": user_text,
+                "author_guid": author_guid,
+                "time": datetime.now().strftime("%H:%M:%S")
+            }
+            save_pending()
+            print(f"[PENDING] Saved id={pending_id}")
+
+            # نوتیف گروه کنترل (اگه ست شده باشه)
+            if OWNER_CONTROL_GROUP:
+                try:
+                    notif = (
+                        f"❓ سوال جدید\n"
+                        f"🆔 چت: `{chat_guid}`\n\n"
+                        f"💬 {user_text}\n\n"
+                        f"🤖 AI: {ai_text}\n\n"
+                        f"⬅️ ریپلای کن تا جواب بفرستم"
+                    )
+                    sent_notif = await client.send_message(OWNER_CONTROL_GROUP, notif)
+                    nid = getattr(sent_notif, "message_id", None)
+                    if nid:
+                        pending_replies[nid] = pending_replies.pop(pending_id)
+                        save_pending()
+                        print(f"[NOTIF] Sent to control group")
+                except Exception as e:
+                    print(f"[NOTIF ERROR] {e}")
+
+            # پیام "منتظر" به کاربر
             try:
                 sent = await update.reply(ai_text)
                 sid = getattr(sent, "message_id", None)
                 if sid:
                     bot_sent_message_ids.add(sid)
             except Exception as e:
-                print(f"[REPLY] Error sending wait msg: {e}")
+                print(f"[REPLY ERROR] {e}")
         else:
             sent = await update.reply(ai_text)
             sid = getattr(sent, "message_id", None)
@@ -553,8 +559,8 @@ if __name__ == "__main__":
     print("=" * 50)
     print("🚀 Bot + Dashboard running")
     print(f"📊 URL: https://your-app.onrender.com/")
-    print(f"📬 Control Group: {OWNER_CONTROL_GROUP or 'NOT SET!'}")
-    print(f"🧠 KB entries: {len(knowledge_base)}")
+    print(f"📬 Control Group: {OWNER_CONTROL_GROUP or 'OFF (فقط پنل)'}")
+    print(f"🧠 KB: {len(knowledge_base)} | ⏳ Pending: {len(pending_replies)}")
     print("=" * 50)
     client.run(phone_number=os.environ.get("RUBIKA_PHONE"))
-      
+            
