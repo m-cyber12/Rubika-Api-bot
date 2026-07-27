@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 api_keys_str = os.environ.get("GEMINI_API_KEYS", os.environ.get("GEMINI_API_KEY", ""))
 api_keys = [k.strip() for k in api_keys_str.split(",") if k.strip()]
 if not api_keys:
-    print("❌ ERROR: No Gemini API keys found! Set GEMINI_API_KEYS or GEMINI_API_KEY")
+    print("❌ ERROR: No Gemini API keys found!")
     exit(1)
 
 def pick_key():
@@ -28,7 +28,6 @@ genai.configure(api_key=pick_key())
 # ==================== تنظیمات ====================
 OWNER_NAME = "حسن"
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
-
 TRIGGER_WORD = "فرایدی"
 
 def get_persian_year():
@@ -49,10 +48,8 @@ BOT_PERSONA = f"""
 - اگه سوالی درباره {OWNER_NAME} پرسیده شد و بلد بودی، مستقیم جواب بده.
 - اگه نمی‌دونی، حتماً بگو: "از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
 - هرگز حدس نزن.
-- اگه کسی از سن یا سال یا تولد پرسید، با توجه به تاریخ امروز حساب کن و فقط عدد سن رو بگو.
+- اگه کسی از سن یا سال یا تولد پرسید، با توجه به سال {PERSIAN_YEAR} شمسی حساب کن.
 """
-
-model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
 
 # --- حافظه‌ها ---
 chat_histories = {}
@@ -266,7 +263,7 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 </div>
 
 <script>
-console.log('JS loaded - v6');
+console.log('JS loaded - v7');
 
 function esc(t){const d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
 
@@ -358,7 +355,7 @@ async function ansPen(id,text){
   try{
     const r=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:parseInt(id),text:text})});
     const d=await r.json();
-    if(d.ok){loadPending();updateStats();}else alert(d.error||'خطا');
+    if(d.ok){loadPending();updateStats();alert(d.message||'✅ ذخیره شد');}else alert(d.error||'خطا');
   }catch(e){alert('❌ خطا');}
 }
 async function loadPending(){
@@ -471,6 +468,7 @@ def api_kb():
 def api_pending():
     return jsonify({"pending": {str(k): v for k, v in pending_replies.items()}})
 
+# ==================== جواب از پنل → فقط KB ذخیره، ارسال نمی‌شه ====================
 @app.route("/api/answer", methods=["POST"])
 def api_answer():
     data = request.get_json() or {}
@@ -482,12 +480,11 @@ def api_answer():
     save_pending()
     knowledge_base[original["user_text"]] = text
     save_kb()
-    ok, result = send_msg_sync(original["chat_guid"], text, reply_to=original.get("message_id"))
-    if ok:
-        return jsonify({"ok": True})
-    pending_replies[pid] = original
-    save_pending()
-    return jsonify({"error": result}), 500
+    # ❌ ارسال نمی‌کنیم! فقط توی KB ذخیره می‌شه
+    return jsonify({
+        "ok": True, 
+        "message": f"✅ جواب ذخیره شد توی دانش. AI ازش استفاده می‌کنه.\n\nسوال: {original['user_text']}\nجواب: {text}"
+    })
 
 @app.route("/api/logs")
 def api_logs():
@@ -500,7 +497,9 @@ def get_chat_session(chat_guid):
     return chat_histories[chat_guid]
 
 def is_age_question(text):
-    keywords = ["چند سال", "سن", "سالش", "عمر", "قدیمی", "تولد", "متولد"]
+    if not text:
+        return False
+    keywords = ["چند سال", "سن", "سالش", "عمر", "قدیمی", "تولد", "متولد", "چندسال"]
     return any(kw in text for kw in keywords)
 
 @client.on_message_updates()
@@ -542,22 +541,8 @@ async def handle_messages(update: Updates):
             save_pending()
             knowledge_base[original["user_text"]] = user_text
             save_kb()
-            try:
-                await client.send_message(
-                    original["chat_guid"], 
-                    user_text, 
-                    reply_to_message_id=original.get("message_id")
-                )
-                await update.reply("✅ جوابت ارسال و ذخیره شد!")
-            except Exception as e:
-                print(f"[CONTROL ERROR] {e}")
-                try:
-                    await client.send_message(original["chat_guid"], user_text)
-                    await update.reply("✅ ارسال شد (بدون ریپلای)")
-                except Exception as e2:
-                    pending_replies[reply_to] = original
-                    save_pending()
-                    await update.reply(f"❌ خطا: {e2}")
+            # فقط تاییدیه ذخیره، ارسال نمی‌کنیم
+            await update.reply("✅ جوابت ذخیره شد توی دانش. AI ازش استفاده می‌کنه.")
             return
         return
 
@@ -580,7 +565,7 @@ async def handle_messages(update: Updates):
     # ۳. بررسی Knowledge Base
     kb_answer = knowledge_base.get(user_text)
     
-    # اگه سوال درباره سن/سالشه باشه، نریم سراغ جواب مستقیم KB. بذار AI با تاریخ امروز حساب کنه
+    # اگه سوال درباره سن/سالشه باشه، نریم سراغ جواب مستقیم KB. بذار AI حساب کنه
     if kb_answer and not is_age_question(user_text) and not is_age_question(kb_answer):
         try:
             await asyncio.sleep(random.uniform(1, 3))
@@ -597,26 +582,40 @@ async def handle_messages(update: Updates):
     try:
         await asyncio.sleep(random.uniform(3, 6))
         
-        # ساخت context
         kb_ctx = ""
         if knowledge_base:
             kb_ctx = "\nاطلاعات شناخته شده درباره صاحب اکانت:\n"
             for q, a in list(knowledge_base.items())[-5:]:
                 kb_ctx += f"- {q}: {a}\n"
         
-        date_ctx = f"\nتاریخ امروز: سال {PERSIAN_YEAR} شمسی (تقریبی).\n"
-        
+        date_ctx = f"\nتاریخ امروز: سال {PERSIAN_YEAR} شمسی.\n"
         full_prompt = user_text + date_ctx + kb_ctx
         
-        # چرخش کلید API
         genai.configure(api_key=pick_key())
         chat = get_chat_session(chat_guid)
         
         response = await chat.send_message_async(full_prompt)
         ai_text = response.text
+        print(f"[AI RAW] {ai_text[:150]}")
 
-        waiting = any(p in ai_text for p in ["می‌پرسم", "ازش می‌پرسم", "بپرسم", "نمی‌دونم", "نمی‌دانم", "نمی دونم", "اطلاع ندارم"])
-        print(f"[AI] waiting={waiting} | {ai_text[:100]}")
+        # تشخیص waiting با regex قوی
+        waiting_patterns = [
+            r"می[‌\s]?پرسم", r"بپرسم", r"ازش\s+می[‌\s]?پرسم",
+            r"نمی[‌\s]?دانم", r"نمی[‌\s]?دونم", r"نمیدونم",
+            r"اطلاع[ات\s]+ندارم", r"اطلاعات\s+کافی\s+ندارم",
+            r"نمی[‌\s]?تونم\s+بگم", r"نمی[‌\s]?توانم\s+بگویم",
+            r"مطمئن\s+نیستم", r"کاملاً?\s+مطمئن\s+نیستم",
+        ]
+        waiting = any(re.search(p, ai_text) for p in waiting_patterns)
+        
+        # fallback: هر سوال درباره حسن که توی KB نباشه
+        is_about_owner = OWNER_NAME in user_text
+        if not waiting and is_about_owner and not kb_answer:
+            waiting = True
+            ai_text = f"از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
+            print(f"[FALLBACK] Forced pending for owner question")
+
+        print(f"[AI] waiting={waiting} | final={ai_text[:100]}")
 
         if waiting:
             # ثبت توی pending
@@ -640,7 +639,7 @@ async def handle_messages(update: Updates):
                         f"🆔 چت: `{chat_guid}`\n\n"
                         f"💬 {user_text}\n\n"
                         f"🤖 AI: {ai_text}\n\n"
-                        f"⬅️ ریپلای کن تا جواب بفرستم"
+                        f"⬅️ ریپلای کن تا ذخیره کنم"
                     )
                     sent_notif = await client.send_message(OWNER_CONTROL_GROUP, notif)
                     nid = getattr(sent_notif, "message_id", None)
