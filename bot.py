@@ -55,71 +55,7 @@ BOT_PERSONA = f"""
 # --- حافظه‌ها ---
 chat_histories = {}
 MAX_TURNS = 10
-
-# FIX #1: آیدی پیام‌های ربات همیشه به صورت «رشته» نگهداری می‌شن
-# چون روبیکا message_id رو str برمی‌گردونه ولی قبلاً جاهایی int می‌شد.
 bot_sent_message_ids = set()
-
-BOT_IDS_FILE = "bot_message_ids.json"   # FIX #1: بعد از ری‌استارت هم یادش بمونه
-MAX_BOT_IDS = 3000
-
-MY_GUID = None  # گویید خود اکانت، بعد از استارت پر می‌شه
-
-
-def norm_id(value):
-    """
-    FIX #1 (کلید اصلی حل باگ ریپلای):
-    همه‌ی آیدی‌ها (message_id / reply_to_message_id) رو به str نرمال می‌کنه
-    تا مقایسه‌ی int با str باعث نشه ریپلای تشخیص داده نشه.
-    """
-    if value is None:
-        return None
-    value = str(value).strip()
-    return value or None
-
-
-def remember_bot_message(sent):
-    """آیدی پیامی که ربات فرستاده رو ذخیره می‌کنه (نرمال‌شده)."""
-    sid = None
-    if sent is not None:
-        sid = norm_id(getattr(sent, "message_id", None))
-        if sid is None:
-            try:
-                sid = norm_id(sent["message_update"]["message_id"])
-            except Exception:
-                sid = None
-    if sid:
-        bot_sent_message_ids.add(sid)
-        if len(bot_sent_message_ids) > MAX_BOT_IDS:
-            for old in list(bot_sent_message_ids)[: len(bot_sent_message_ids) - MAX_BOT_IDS]:
-                bot_sent_message_ids.discard(old)
-        save_bot_ids()
-    return sid
-
-
-def get_reply_to_id(update):
-    """
-    FIX #1: گرفتن آیدی پیامی که کاربر بهش ریپلای زده.
-    rubpy فقط پراپرتی reply_message_id داره؛ reply_to_message_id مستقیم روی
-    Update نیست و از داخل message خونده می‌شه. اینجا همه‌ی حالت‌ها چک می‌شن.
-    """
-    for attr in ("reply_message_id", "reply_to_message_id"):
-        try:
-            val = getattr(update, attr, None)
-        except Exception:
-            val = None
-        if val:
-            return norm_id(val)
-    # آخرین تلاش: مستقیم از دیکشنری خام آپدیت
-    try:
-        raw = update.original_update or {}
-        msg = raw.get("message") or {}
-        val = msg.get("reply_to_message_id") or raw.get("reply_to_message_id")
-        if val:
-            return norm_id(val)
-    except Exception:
-        pass
-    return None
 
 KB_FILE = "knowledge_base.json"
 knowledge_base = {}
@@ -154,21 +90,17 @@ def save_json(path, data):
         return False
 
 def load_all():
-    global knowledge_base, pending_replies, chat_logs, bot_sent_message_ids
+    global knowledge_base, pending_replies, chat_logs
     knowledge_base = load_json(KB_FILE, {})
     pending_raw = load_json(PENDING_FILE, {})
     pending_replies = {}
-    # FIX #2: کلیدها به صورت str نگه داشته می‌شن.
-    # قبلاً int(k) بود و هر کلیدی که عددی نبود (یا کلید ذخیره‌شده‌ی
-    # message_id گروه کنترل که str بود) با except رد می‌شد و pending خالی می‌موند.
     for k, v in pending_raw.items():
-        key = norm_id(k)
-        if key:
-            pending_replies[key] = v
+        try:
+            pending_replies[int(k)] = v
+        except:
+            pass
     chat_logs = load_json(LOG_FILE, [])
-    bot_sent_message_ids = set(norm_id(i) for i in load_json(BOT_IDS_FILE, []) if norm_id(i))
-    print(f"[STARTUP] KB={len(knowledge_base)}, Pending={len(pending_replies)}, "
-          f"Logs={len(chat_logs)}, BotMsgIDs={len(bot_sent_message_ids)}")
+    print(f"[STARTUP] KB={len(knowledge_base)}, Pending={len(pending_replies)}, Logs={len(chat_logs)}")
 
 def save_kb():
     if save_json(KB_FILE, knowledge_base):
@@ -178,9 +110,6 @@ def save_pending():
     ok = save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()})
     if ok:
         print(f"[SAVE] Pending: {len(pending_replies)} items")
-
-def save_bot_ids():
-    save_json(BOT_IDS_FILE, list(bot_sent_message_ids))
 
 def save_logs():
     save_json(LOG_FILE, chat_logs)
@@ -426,9 +355,7 @@ document.getElementById('btn-add-kb').addEventListener('click', addKB);
 async function ansPen(id,text){
   text=text.trim(); if(!text) return;
   try{
-    /* FIX #2: آیدی رو رشته‌ای می‌فرستیم. parseInt روی آیدی‌های بلند روبیکا
-       (که از حد Number رد می‌شن یا صفر ابتدایی دارن) خرابش می‌کرد و 404 می‌گرفتیم. */
-    const r=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:String(id),text:text})});
+    const r=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:parseInt(id),text:text})});
     const d=await r.json();
     if(d.ok){
       loadPending(); updateStats(); 
@@ -447,7 +374,7 @@ async function loadPending(){
     if(entries.length===0){list.innerHTML='<div class="empty">سوالی در انتظار نیست</div>';return;}
     for(const [id,info] of entries){
       const item=document.createElement('div'); item.className='pending-item';
-      item.innerHTML='<div><b>#'+esc(id)+'</b> <span class="small">'+esc(info.chat_guid)+' • '+esc(info.time||'')+'</span><br>'+esc(info.user_text)+'</div>';
+      item.innerHTML='<div><b>#'+id+'</b> <span class="small">'+esc(info.chat_guid)+'</span><br>'+esc(info.user_text)+'</div>';
       list.appendChild(item);
       const row=document.createElement('div'); row.className='pending-row';
       const inp=document.createElement('input'); inp.type='text'; inp.placeholder='جوابت رو بنویس...';
@@ -473,18 +400,12 @@ async function loadLogs(){
   }catch(e){list.innerHTML='<div class="empty">❌ خطا در بارگذاری</div>';}
 }
 
-let lastPenCount=-1;
 async function updateStats(){
   try{
     const r=await fetch('/api/stats'); const d=await r.json();
     document.getElementById('st-kb').textContent=d.kb;
     document.getElementById('st-pen').textContent=d.pen;
     document.getElementById('st-log').textContent=d.today;
-    /* FIX #2: اگه تب سوالات بازه و تعدادش عوض شده، خودکار تازه بشه.
-       (فقط وقتی تعداد فرق کرده، تا متنی که داری تایپ می‌کنی پاک نشه) */
-    const pp=document.getElementById('panel-pending');
-    if(pp && pp.classList.contains('active') && d.pen!==lastPenCount) loadPending();
-    lastPenCount=d.pen;
   }catch(e){console.log('stats error',e);}
 }
 
@@ -553,24 +474,14 @@ def api_kb():
 
 @app.route("/api/pending")
 def api_pending():
-    # FIX #2: کلیدها str و جدیدترین سوال بالاتر
-    items = sorted(
-        pending_replies.items(),
-        key=lambda kv: (kv[1].get("date", ""), kv[1].get("time", "")),
-        reverse=True,
-    )
-    return jsonify({"pending": {str(k): v for k, v in items}, "count": len(items)})
+    return jsonify({"pending": {str(k): v for k, v in pending_replies.items()}})
 
 # جواب از پنل → فقط KB ذخیره، ارسال نمی‌شه
 @app.route("/api/answer", methods=["POST"])
 def api_answer():
     data = request.get_json() or {}
-    # FIX #2: آیدی از پنل به صورت رشته/عدد میاد؛ نرمال‌سازی می‌شه
-    # تا با کلید ذخیره‌شده (str) مچ بشه. قبلاً همیشه 404 می‌داد.
-    pid = norm_id(data.get("id"))
+    pid = data.get("id")
     text = data.get("text", "").strip()
-    if not text:
-        return jsonify({"error": "متن جواب خالیه"}), 400
     if pid not in pending_replies:
         return jsonify({"error": "Not found"}), 404
     original = pending_replies.pop(pid)
@@ -586,14 +497,10 @@ def api_answer():
 def api_logs():
     return jsonify({"logs": chat_logs})
 
-    # ==================== قسمت ۲: ربات روبیکا ====================
-# نکته: این تابع قبلاً به متغیر `model` اشاره می‌کرد که هیچ‌جا تعریف نشده بود
-# (NameError). چون هیچ‌جا صدا زده نمی‌شد باگ خودش رو نشون نمی‌داد؛ درستش شد.
+# ==================== قسمت ۲: ربات روبیکا ====================
 def get_chat_session(chat_guid):
     if chat_guid not in chat_histories:
-        genai.configure(api_key=pick_key())
-        m = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
-        chat_histories[chat_guid] = m.start_chat(history=[])
+        chat_histories[chat_guid] = model.start_chat(history=[])
     return chat_histories[chat_guid]
 
 def is_age_question(text):
@@ -604,53 +511,6 @@ def is_age_question(text):
 def is_about_owner(text):
     return OWNER_NAME in text if text else False
 
-
-# FIX #2: لیست کامل‌تر عبارت‌های «نمی‌دونم» تا سوال حتماً توی صف بیفته
-WAITING_PATTERNS = [
-    r"می[‌\s]?پرسم", r"بپرسم", r"سوال\s*می[‌\s]?کنم",
-    r"نمی[‌\s]?دان", r"نمی[‌\s]?دون", r"نمیدون", r"نمیدان",
-    r"اطلاع\w*\s*(دقیقی\s*)?ندار", r"اطلاعی\s*ندار", r"خبر\s*ندار",
-    r"مطمئن\s*نیستم", r"نمی[‌\s]?تونم\s*(بگم|جواب)", r"یادم\s*نیست",
-    r"در\s*جریان\s*نیستم", r"چیزی\s*ندار",
-]
-
-
-def looks_like_waiting(text):
-    if not text:
-        return False
-    return any(re.search(p, text) for p in WAITING_PATTERNS)
-
-
-async def is_reply_to_me(update, reply_to):
-    """
-    FIX #1: تشخیص اینکه کاربر به پیام «ربات» ریپلای زده یا نه.
-    مرحله ۱ (سریع): آیدی توی حافظه‌ی پیام‌های ارسالی ربات هست؟
-    مرحله ۲ (مطمئن): اگه نبود (ری‌استارت شده یا حافظه پاک شده)،
-    خود پیام ریپلای‌شده رو از سرور می‌گیریم و می‌بینیم نویسنده‌ش خودمونیم یا نه.
-    """
-    if not reply_to:
-        return False
-
-    if reply_to in bot_sent_message_ids:
-        return True
-
-    try:
-        result = await client.get_messages_by_id(
-            getattr(update, "object_guid", None), [str(reply_to)]
-        )
-        messages = getattr(result, "messages", None) or []
-        if messages:
-            author = norm_id(getattr(messages[0], "author_object_guid", None))
-            me = norm_id(MY_GUID or getattr(client, "guid", None))
-            if author and me and author == me:
-                bot_sent_message_ids.add(reply_to)   # کش کن برای دفعه بعد
-                save_bot_ids()
-                return True
-    except Exception as e:
-        print(f"[REPLY CHECK ERROR] {e}")
-
-    return False
-
 @client.on_message_updates()
 async def handle_messages(update: Updates):
     global main_loop
@@ -660,22 +520,17 @@ async def handle_messages(update: Updates):
     chat_guid = getattr(update, "object_guid", "") or ""
     user_text = getattr(update, "text", None)
     author_guid = getattr(update, "author_guid", "") or ""
-
-    # FIX #1: دیگه int() نمی‌کنیم. روبیکا آیدی رو رشته می‌ده و
-    # تبدیل به int باعث می‌شد مقایسه با reply_to_message_id (رشته) همیشه False بشه.
-    message_id = norm_id(getattr(update, "message_id", None))
-
+    raw_msg_id = getattr(update, "message_id", None)
+    
+    try:
+        message_id = int(raw_msg_id) if raw_msg_id is not None else None
+    except:
+        message_id = None
+    
     if not user_text:
         return
 
-    # FIX #1: پیام‌های خود ربات رو نادیده بگیر (جلوگیری از حلقه‌ی جواب به خود)
-    me = norm_id(MY_GUID or getattr(client, "guid", None))
-    if me and norm_id(author_guid) == me:
-        if message_id:
-            bot_sent_message_ids.add(message_id)
-        return
-
-# لاگ
+    # لاگ
     chat_logs.append({
         "time": datetime.now().strftime("%H:%M:%S"),
         "date": datetime.now().strftime("%Y-%m-%d"),
@@ -687,29 +542,15 @@ async def handle_messages(update: Updates):
         chat_logs.pop(0)
     save_logs()
 
-    # FIX #1: آیدی پیامی که بهش ریپلای شده، یک‌بار و درست خونده می‌شه
-    reply_to = get_reply_to_id(update)
-
     # ۱. گروه کنترل (اگه ست شده باشه)
     if OWNER_CONTROL_GROUP and chat_guid == OWNER_CONTROL_GROUP:
+        reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
         if reply_to and reply_to in pending_replies:
             original = pending_replies.pop(reply_to)
             save_pending()
             knowledge_base[original["user_text"]] = user_text
             save_kb()
             await update.reply("✅ جوابت ذخیره شد توی دانش.")
-
-            # FIX #2: جواب رو برای همون کسی که پرسیده بود هم بفرست
-            target = original.get("chat_guid")
-            if target:
-                try:
-                    sent = await client.send_message(
-                        target, user_text,
-                        reply_to_message_id=original.get("message_id") or None
-                    )
-                    remember_bot_message(sent)
-                except Exception as e:
-                    print(f"[FORWARD ANSWER ERROR] {e}")
             return
         return
 
@@ -719,15 +560,11 @@ async def handle_messages(update: Updates):
         if author_guid and author_guid != chat_guid:
             return
     else:
-        # FIX #1: مقایسه‌ی نرمال‌شده + fallback به سرور
-        is_reply_to_bot = await is_reply_to_me(update, reply_to)
-        has_trigger = TRIGGER_WORD in user_text
-        print(f"[GROUP] reply_to={reply_to} is_reply_to_bot={is_reply_to_bot} trigger={has_trigger}")
-
-        if not has_trigger and not is_reply_to_bot:
+        reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
+        is_reply_to_bot = reply_to is not None and reply_to in bot_sent_message_ids
+        if TRIGGER_WORD not in user_text and not is_reply_to_bot:
             return
-        if has_trigger:
-            user_text = user_text.replace(TRIGGER_WORD, "", 1).strip()
+        user_text = user_text.replace(TRIGGER_WORD, "", 1).strip()
         if not user_text:
             user_text = "سلام"
 
@@ -740,7 +577,9 @@ async def handle_messages(update: Updates):
         try:
             await asyncio.sleep(random.uniform(1, 3))
             sent = await update.reply(kb_answer)
-            remember_bot_message(sent)   # FIX #1
+            sid = getattr(sent, "message_id", None)
+            if sid:
+                bot_sent_message_ids.add(sid)
             print("[KB] Direct reply")
             return
         except Exception as e:
@@ -775,43 +614,39 @@ async def handle_messages(update: Updates):
         ai_text = response.text
         print(f"[AI RAW] {ai_text[:120]}")
 
-        # تشخیص waiting  (FIX #2: الگوهای کامل‌تر)
-        waiting = looks_like_waiting(ai_text)
-        if waiting:
+        # تشخیص waiting
+        waiting = False
+        if any(re.search(p, ai_text) for p in [r"می[‌\s]?پرسم", r"بپرسم", r"نمی[‌\s]?دانم", r"نمی[‌\s]?دونم", r"نمیدونم", r"اطلاع[ات\s]+ندارم", r"مطمئن\s+نیستم"]):
+            waiting = True
             print("[AI] Detected waiting phrase")
-
+        
         # fallback: سوال درباره حسن بدون جواب KB
         if not waiting and is_about_owner(user_text) and not kb_answer:
             waiting = True
             ai_text = f"از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
             print("[FALLBACK] Owner question, no KB -> pending")
 
-if waiting:
+        if waiting:
             # ثبت pending
-            # FIX #2: کلید همیشه str، تا با /api/pending و /api/answer یکی باشه
-            pending_id = str(random.randint(100000, 999999))
-            entry = {
+            pending_id = random.randint(100000, 999999)
+            pending_replies[pending_id] = {
                 "chat_guid": chat_guid,
                 "user_text": user_text,
                 "author_guid": author_guid,
                 "message_id": message_id,
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "date": datetime.now().strftime("%Y-%m-%d"),
+                "time": datetime.now().strftime("%H:%M:%S")
             }
-            pending_replies[pending_id] = entry
             save_pending()
-            print(f"[PENDING] id={pending_id} total={len(pending_replies)}")
+            print(f"[PENDING] id={pending_id}")
 
             # نوتیف گروه کنترل
             if OWNER_CONTROL_GROUP:
                 try:
                     notif = f"❓ سوال جدید\n🆔 {chat_guid}\n\n💬 {user_text}\n\n🤖 {ai_text}\n\n⬅️ ریپلای کن تا ذخیره کنم"
                     sent_notif = await client.send_message(OWNER_CONTROL_GROUP, notif)
-                    nid = norm_id(getattr(sent_notif, "message_id", None))
-                    # FIX #2: کلید رو با آیدی پیام گروه کنترل عوض می‌کنیم
-                    # ولی حواسمون هست که entry گم نشه اگه nid تکراری/خالی بود.
-                    if nid and nid != pending_id:
-                        pending_replies[nid] = pending_replies.pop(pending_id, entry)
+                    nid = getattr(sent_notif, "message_id", None)
+                    if nid:
+                        pending_replies[nid] = pending_replies.pop(pending_id)
                         pending_replies[nid]["message_id"] = message_id
                         save_pending()
                 except Exception as e:
@@ -820,12 +655,14 @@ if waiting:
             # پیام "منتظر" به کاربر
             try:
                 sent = await update.reply(ai_text)
-                remember_bot_message(sent)   # FIX #1
+                if getattr(sent, "message_id", None):
+                    bot_sent_message_ids.add(sent.message_id)
             except Exception as e:
                 print(f"[REPLY ERROR] {e}")
         else:
             sent = await update.reply(ai_text)
-            remember_bot_message(sent)       # FIX #1
+            if getattr(sent, "message_id", None):
+                bot_sent_message_ids.add(sent.message_id)
             print("[AI] Direct reply sent")
 
     except Exception as e:
@@ -853,25 +690,10 @@ if __name__ == "__main__":
     print("=" * 50)
     
     RUBIKA_PHONE = os.environ.get("RUBIKA_PHONE") or os.environ.get("rubika_phone")
-
-    # FIX #1: بعد از استارت، گوییدِ خود اکانت رو می‌گیریم تا بتونیم
-    # تشخیص بدیم یه پیام مالِ خودمونه یا نه (برای تشخیص ریپلای به ربات).
-    async def _boot():
-        global MY_GUID, main_loop
-        main_loop = asyncio.get_running_loop()
-        try:
-            me = await client.get_me()
-            MY_GUID = norm_id(
-                getattr(getattr(me, "user", None), "user_guid", None)
-                or getattr(client, "guid", None)
-            )
-            print(f"[BOOT] MY_GUID = {MY_GUID}")
-        except Exception as e:
-            print(f"[BOOT] get_me failed: {e}")
-
     if RUBIKA_PHONE:
         print(f"📱 Phone: {RUBIKA_PHONE[:6]}...")
-        client.run(_boot(), phone_number=RUBIKA_PHONE)
+        client.run(phone_number=RUBIKA_PHONE)
     else:
         print("📱 Session auth...")
-        client.run(_boot())
+        client.run()
+        
