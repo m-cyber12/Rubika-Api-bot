@@ -60,12 +60,17 @@ def get_chat_session(chat_guid):
 async def reply_to_pv(update: Updates):
     chat_guid = getattr(update, "object_guid", "") or ""
     user_text = getattr(update, "text", None)
+    author_guid = getattr(update, "author_guid", "") or ""
     if not user_text:
         return
 
     is_private = chat_guid.startswith("u0")
 
-    if not is_private:
+    if is_private:
+        # جلوگیری از لوپ: اگه فرستنده با طرف مقابل چت فرق داره، یعنی خودمون فرستادیمش
+        if author_guid and author_guid != chat_guid:
+            return
+    else:
         if TRIGGER_WORD not in user_text:
             return  # توی گروه/کانال، فقط وقتی کلمه‌ی کلیدی صدا زده بشه جواب بده
         user_text = user_text.replace(TRIGGER_WORD, "", 1).strip()
@@ -76,9 +81,9 @@ async def reply_to_pv(update: Updates):
     try:
         await asyncio.sleep(random.uniform(5, 8))
         chat = get_chat_session(chat_guid)
-        response = await asyncio.to_thread(chat.send_message, user_text)
+        response = await chat.send_message_async(user_text)
         if len(chat.history) > MAX_TURNS * 2:
-            chat.history = chat.history[-MAX_TURNS * 2:]
+            chat_histories[chat_guid] = model.start_chat(history=chat.history[-MAX_TURNS * 2:])
         await update.reply(response.text)
         print("Reply sent!")
     except Exception as e:
