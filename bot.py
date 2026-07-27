@@ -17,7 +17,6 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 OWNER_NAME = "حسن"
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
 
-# اسم کلیدی که توی گروه‌ها ربات رو صدا می‌زنه
 TRIGGER_WORD = "فرایدی"
 
 BOT_PERSONA = f"""
@@ -85,14 +84,34 @@ def save_kb(): save_json(KB_FILE, knowledge_base)
 def save_pending(): save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()})
 def save_logs(): save_json(LOG_FILE, chat_logs)
 
-# --- Restore Rubika session ---
+# --- Restore Rubika session (robust: tries both upper and lower case) ---
 SESSION_FILE = "my_rubika_account.rp"
-session_b64 = (os.environ.get("SESSION_B64_PART1", "") + os.environ.get("SESSION_B64_PART2", ""))
+
+# Try uppercase first (original names)
+part1 = os.environ.get("SESSION_B64_PART1", "")
+part2 = os.environ.get("SESSION_B64_PART2", "")
+session_b64 = part1 + part2
+
+# If empty, try lowercase
+if not session_b64:
+    part1 = os.environ.get("session_b64_part1", "")
+    part2 = os.environ.get("session_b64_part2", "")
+    session_b64 = part1 + part2
+    if session_b64:
+        print("[SESSION] Found lowercase session_b64_part1/part2")
+
 if session_b64 and not os.path.exists(SESSION_FILE):
     import base64
-    with open(SESSION_FILE, "wb") as f:
-        f.write(base64.b64decode(session_b64))
-    print("Session restored")
+    try:
+        with open(SESSION_FILE, "wb") as f:
+            f.write(base64.b64decode(session_b64))
+        print(f"[SESSION] Restored {SESSION_FILE}: {os.path.getsize(SESSION_FILE)} bytes")
+    except Exception as e:
+        print(f"[SESSION] Restore error: {e}")
+elif os.path.exists(SESSION_FILE):
+    print(f"[SESSION] File already exists: {os.path.getsize(SESSION_FILE)} bytes")
+else:
+    print("[SESSION] No session env vars found! Bot will ask for phone number.")
 
 client = Client(name="my_rubika_account")
 
@@ -609,13 +628,6 @@ async def handle_messages(update: Updates):
 if __name__ == "__main__":
     load_all()
     
-    # چک کردن متغیرهای ضروری قبل از استارت
-    RUBIKA_PHONE = os.environ.get("RUBIKA_PHONE", "").strip()
-    if not RUBIKA_PHONE:
-        print("❌ ERROR: RUBIKA_PHONE is not set!")
-        print("Please set RUBIKA_PHONE in Render dashboard → Environment.")
-        exit(1)
-    
     def run_web():
         port = int(os.environ.get("PORT", 10000))
         app.run(host="0.0.0.0", port=port, threaded=True)
@@ -628,4 +640,11 @@ if __name__ == "__main__":
     print(f"🧠 KB: {len(knowledge_base)} | ⏳ Pending: {len(pending_replies)}")
     print("=" * 50)
     
-    client.run(phone_number=RUBIKA_PHONE)
+    # اگه سشن موجود باشه، نیازی به شماره نیست
+    RUBIKA_PHONE = os.environ.get("RUBIKA_PHONE") or os.environ.get("rubika_phone")
+    if RUBIKA_PHONE:
+        print(f"📱 Using phone: {RUBIKA_PHONE[:6]}...")
+        client.run(phone_number=RUBIKA_PHONE)
+    else:
+        print("📱 No phone number set, trying session auth...")
+        client.run()
