@@ -15,9 +15,6 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # ==================== تنظیمات ====================
 OWNER_NAME = "آقای حسن‌پور"
-
-# این اختیاریه. اگه خالی باشه، فقط از پنل وب سوالات رو می‌بینی
-# اگه GUID گروه روبیکات رو اینجا بذاری، اونجا هم نوتیف میاد
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
 
 BOT_PERSONA = f"""
@@ -47,6 +44,8 @@ pending_replies = {}
 
 LOG_FILE = "chat_log.json"
 chat_logs = []
+
+main_loop = None  # reference to asyncio loop for cross-thread calls
 
 # --- Load/Save ---
 def load_json(path, default):
@@ -94,10 +93,13 @@ if session_b64 and not os.path.exists(SESSION_FILE):
 
 client = Client(name="my_rubika_account")
 
-# ==================== HELPER ====================
+# ==================== HELPER: ارسال پیام از ترد Flask ====================
 def send_msg_sync(guid, text):
     if not guid or not text:
-        return False, "Empty"
+        return False, "Empty guid or text"
+    if main_loop is None:
+        return False, "Bot not ready yet"
+    
     async def _send():
         try:
             result = await client.send_message(guid, text)
@@ -105,14 +107,12 @@ def send_msg_sync(guid, text):
         except Exception as e:
             print(f"[SEND FAIL] {guid}: {e}")
             return False, str(e)
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(_send(), loop)
-        try:
-            return future.result(timeout=15)
-        except Exception as e:
-            return False, str(e)
-    return False, "Loop not running"
+    
+    try:
+        future = asyncio.run_coroutine_threadsafe(_send(), main_loop)
+        return future.result(timeout=15)
+    except Exception as e:
+        return False, str(e)
 
 # ==================== FLASK APP ====================
 app = Flask(__name__)
@@ -134,7 +134,7 @@ h1{color:#58a6ff;text-align:center;margin-bottom:12px;font-size:20px}
 .stat .num{font-size:24px;font-weight:bold;color:#3fb950}
 .stat .label{font-size:11px;color:#8b949e;margin-top:3px}
 .tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;justify-content:center}
-.tab{background:#21262d;border:1px solid #30363d;border-radius:8px;padding:9px 14px;cursor:pointer;font-size:13px;transition:.2s}
+.tab{background:#21262d;border:1px solid #30363d;border-radius:8px;padding:9px 14px;cursor:pointer;font-size:13px;transition:.2s;color:#c9d1d9}
 .tab:hover{background:#30363d}
 .tab.active{background:#238636;color:#fff;border-color:#238636;font-weight:bold}
 .panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:14px;display:none}
@@ -170,19 +170,19 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 </div>
 
 <div class="tabs">
-  <div class="tab active" id="tab-btn-chat" onclick="switchTab('chat')">💬 چت با AI</div>
-  <div class="tab" id="tab-btn-send" onclick="switchTab('send')">📨 ارسال پیام</div>
-  <div class="tab" id="tab-btn-kb" onclick="switchTab('kb')">📚 دانش</div>
-  <div class="tab" id="tab-btn-pending" onclick="switchTab('pending')">⏳ سوالات</div>
-  <div class="tab" id="tab-btn-logs" onclick="switchTab('logs')">📋 لاگ</div>
+  <button type="button" class="tab active" data-tab="chat">💬 چت با AI</button>
+  <button type="button" class="tab" data-tab="send">📨 ارسال پیام</button>
+  <button type="button" class="tab" data-tab="kb">📚 دانش</button>
+  <button type="button" class="tab" data-tab="pending">⏳ سوالات</button>
+  <button type="button" class="tab" data-tab="logs">📋 لاگ</button>
 </div>
 
 <!-- چت -->
 <div id="panel-chat" class="panel active">
   <div class="msg-box" id="chat-box"></div>
   <div style="display:flex;gap:8px">
-    <input type="text" id="chat-in" placeholder="پیامت رو بنویس..." onkeydown="if(event.key==='Enter') sendChat()" style="flex:1;margin:0">
-    <button onclick="sendChat()">ارسال</button>
+    <input type="text" id="chat-in" placeholder="پیامت رو بنویس..." style="flex:1;margin:0">
+    <button type="button" id="btn-chat-send">ارسال</button>
   </div>
 </div>
 
@@ -190,7 +190,7 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 <div id="panel-send" class="panel">
   <input type="text" id="s-guid" placeholder="GUID چت (مثلاً u0...)">
   <textarea id="s-text" placeholder="متن پیام..."></textarea>
-  <button onclick="sendMsg()">📤 ارسال</button>
+  <button type="button" id="btn-send-msg">📤 ارسال</button>
   <p class="small">GUID رو از تب لاگ پیدا کن</p>
 </div>
 
@@ -198,7 +198,7 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 <div id="panel-kb" class="panel">
   <input type="text" id="k-q" placeholder="سوال (مثلاً: شغلت چیه؟)">
   <textarea id="k-a" placeholder="جواب..."></textarea>
-  <button onclick="addKB()">➕ ذخیره</button>
+  <button type="button" id="btn-add-kb">➕ ذخیره</button>
   <hr>
   <div id="kb-list"></div>
 </div>
@@ -216,107 +216,230 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 </div>
 
 <script>
+console.log('JS loaded - v2');
+
+function esc(t){
+  const d=document.createElement('div');
+  d.textContent=t||'';
+  return d.innerHTML;
+}
+
 function switchTab(name){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
-  document.getElementById('tab-btn-'+name).classList.add('active');
+  document.querySelector('[data-tab="'+name+'"]').classList.add('active');
   if(name==='kb') loadKB();
   if(name==='pending') loadPending();
   if(name==='logs') loadLogs();
 }
 
-async function sendChat(){
-  const inp=document.getElementById('chat-in');
-  const t=inp.value.trim(); if(!t) return;
-  inp.value='';
-  addChat('u',t);
-  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:t})});
-  const d=await r.json();
-  addChat('a',d.reply||d.error||'خطا');
-}
+// ----- تب‌ها -----
+document.querySelectorAll('.tab').forEach(function(btn){
+  btn.addEventListener('click', function(){
+    switchTab(this.getAttribute('data-tab'));
+  });
+});
+
+// ----- چت با AI -----
 function addChat(role,text){
   const b=document.getElementById('chat-box');
   const d=document.createElement('div');
   d.className='msg msg-'+role;
   d.innerHTML=(role==='u'?'👤 <b>تو:</b> ':'🤖 <b>AI:</b> ')+esc(text);
-  b.appendChild(d); b.scrollTop=b.scrollHeight;
+  b.appendChild(d);
+  b.scrollTop=b.scrollHeight;
 }
 
+async function sendChat(){
+  const inp=document.getElementById('chat-in');
+  const t=inp.value.trim();
+  if(!t) return;
+  inp.value='';
+  addChat('u',t);
+  try{
+    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:t})});
+    const d=await r.json();
+    addChat('a',d.reply||d.error||'خطا');
+  }catch(e){
+    addChat('a','❌ خطای شبکه');
+  }
+}
+
+document.getElementById('btn-chat-send').addEventListener('click', sendChat);
+document.getElementById('chat-in').addEventListener('keydown', function(e){
+  if(e.key==='Enter') sendChat();
+});
+
+// ----- ارسال پیام -----
 async function sendMsg(){
   const g=document.getElementById('s-guid').value.trim();
   const t=document.getElementById('s-text').value.trim();
   if(!g||!t) return alert('GUID و متن رو پر کن!');
-  const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guid:g,text:t})});
-  const d=await r.json();
-  alert(d.ok?'✅ ارسال شد!':'❌ '+ (d.error||'خطا'));
+  try{
+    const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guid:g,text:t})});
+    const d=await r.json();
+    alert(d.ok?'✅ ارسال شد!':'❌ '+(d.error||'خطا'));
+  }catch(e){
+    alert('❌ خطای شبکه');
+  }
 }
 
+document.getElementById('btn-send-msg').addEventListener('click', sendMsg);
+
+// ----- دانش -----
 async function addKB(){
   const q=document.getElementById('k-q').value.trim();
   const a=document.getElementById('k-a').value.trim();
   if(!q||!a) return alert('سوال و جواب رو پر کن!');
-  await fetch('/api/kb',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q,a})});
-  document.getElementById('k-q').value='';
-  document.getElementById('k-a').value='';
-  loadKB(); updateStats();
+  try{
+    await fetch('/api/kb',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q,a})});
+    document.getElementById('k-q').value='';
+    document.getElementById('k-a').value='';
+    loadKB();
+    updateStats();
+  }catch(e){
+    alert('❌ خطا');
+  }
 }
+
 async function delKB(q){
   if(!confirm('حذف شود؟')) return;
-  await fetch('/api/kb?q='+encodeURIComponent(q),{method:'DELETE'});
-  loadKB(); updateStats();
+  try{
+    await fetch('/api/kb?q='+encodeURIComponent(q),{method:'DELETE'});
+    loadKB();
+    updateStats();
+  }catch(e){
+    alert('❌ خطا');
+  }
 }
+
 async function loadKB(){
-  const r=await fetch('/api/kb'); const d=await r.json();
-  const l=document.getElementById('kb-list');
-  const items=Object.entries(d.kb||{});
-  if(items.length===0){l.innerHTML='<div class="empty">دانشی ذخیره نشده</div>';return;}
-  l.innerHTML='';
-  items.forEach(([q,a])=>{
-    l.innerHTML+='<div class="kb-item"><div><b>س:</b> '+esc(q)+'<br><b>ج:</b> '+esc(a)+'</div><button class="btn-red" onclick=\"delKB(\''+esc(q).replace(/'/g,"\\'")+'\')\">🗑</button></div>';
-  });
+  const list=document.getElementById('kb-list');
+  try{
+    const r=await fetch('/api/kb');
+    const d=await r.json();
+    const items=d.kb||{};
+    list.innerHTML='';
+    if(Object.keys(items).length===0){
+      list.innerHTML='<div class="empty">دانشی ذخیره نشده</div>';
+      return;
+    }
+    for(const [q,a] of Object.entries(items)){
+      const div=document.createElement('div');
+      div.className='kb-item';
+      div.innerHTML='<div><b>س:</b> '+esc(q)+'<br><b>ج:</b> '+esc(a)+'</div>';
+      const btn=document.createElement('button');
+      btn.className='btn-red';
+      btn.textContent='🗑';
+      btn.addEventListener('click', function(){ delKB(q); });
+      div.appendChild(btn);
+      list.appendChild(div);
+    }
+  }catch(e){
+    list.innerHTML='<div class="empty">❌ خطا در بارگذاری</div>';
+  }
+}
+
+document.getElementById('btn-add-kb').addEventListener('click', addKB);
+
+// ----- سوالات -----
+async function ansPen(id, text){
+  text=text.trim();
+  if(!text) return;
+  try{
+    const r=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:parseInt(id),text:text})});
+    const d=await r.json();
+    if(d.ok){
+      loadPending();
+      updateStats();
+    }else{
+      alert(d.error||'خطا');
+    }
+  }catch(e){
+    alert('❌ خطا');
+  }
 }
 
 async function loadPending(){
-  const r=await fetch('/api/pending'); const d=await r.json();
-  const l=document.getElementById('pending-list');
-  const items=Object.entries(d.pending||{});
-  if(items.length===0){l.innerHTML='<div class="empty">سوالی در انتظار نیست</div>';return;}
-  l.innerHTML='';
-  items.forEach(([id,info])=>{
-    l.innerHTML+='<div class="pending-item"><div><b>#'+id+'</b> &nbsp; <span class="small">'+esc(info.chat_guid)+'</span><br>'+esc(info.user_text)+'</div></div>'+
-    '<div class="pending-row"><input type="text" id="ans-'+id+'" placeholder="جوابت رو بنویس..." onkeydown="if(event.key===\'Enter\') ansPen('+id+')"><button onclick="ansPen('+id+')">✅</button></div>';
-  });
-}
-async function ansPen(id){
-  const inp=document.getElementById('ans-'+id);
-  const t=inp.value.trim(); if(!t) return;
-  const r=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:parseInt(id),text:t})});
-  const d=await r.json();
-  if(d.ok){loadPending();updateStats();}else alert(d.error||'خطا');
+  const list=document.getElementById('pending-list');
+  try{
+    const r=await fetch('/api/pending');
+    const d=await r.json();
+    const items=d.pending||{};
+    list.innerHTML='';
+    const entries=Object.entries(items);
+    if(entries.length===0){
+      list.innerHTML='<div class="empty">سوالی در انتظار نیست</div>';
+      return;
+    }
+    for(const [id,info] of entries){
+      const item=document.createElement('div');
+      item.className='pending-item';
+      item.innerHTML='<div><b>#'+id+'</b> <span class="small">'+esc(info.chat_guid)+'</span><br>'+esc(info.user_text)+'</div>';
+      list.appendChild(item);
+      
+      const row=document.createElement('div');
+      row.className='pending-row';
+      
+      const inp=document.createElement('input');
+      inp.type='text';
+      inp.placeholder='جوابت رو بنویس...';
+      inp.addEventListener('keydown', function(e){
+        if(e.key==='Enter') ansPen(id, inp.value);
+      });
+      
+      const btn=document.createElement('button');
+      btn.textContent='✅';
+      btn.addEventListener('click', function(){ ansPen(id, inp.value); });
+      
+      row.appendChild(inp);
+      row.appendChild(btn);
+      list.appendChild(row);
+    }
+  }catch(e){
+    list.innerHTML='<div class="empty">❌ خطا در بارگذاری</div>';
+  }
 }
 
+// ----- لاگ -----
 async function loadLogs(){
-  const r=await fetch('/api/logs'); const d=await r.json();
-  const l=document.getElementById('logs-list');
-  const logs=(d.logs||[]).slice().reverse();
-  if(logs.length===0){l.innerHTML='<div class="empty">لاگ خالیه</div>';return;}
-  l.innerHTML='';
-  logs.forEach(log=>{
-    l.innerHTML+='<div class="msg msg-u"><span class="small">'+esc(log.time)+' | '+esc(log.guid)+'</span><br><b>'+esc(log.from)+':</b> '+esc(log.text)+'</div>';
-  });
+  const list=document.getElementById('logs-list');
+  try{
+    const r=await fetch('/api/logs');
+    const d=await r.json();
+    const logs=(d.logs||[]).slice().reverse();
+    list.innerHTML='';
+    if(logs.length===0){
+      list.innerHTML='<div class="empty">لاگ خالیه</div>';
+      return;
+    }
+    for(const log of logs){
+      const div=document.createElement('div');
+      div.className='msg msg-u';
+      div.innerHTML='<span class="small">'+esc(log.time)+' | '+esc(log.guid)+'</span><br><b>'+esc(log.from)+':</b> '+esc(log.text);
+      list.appendChild(div);
+    }
+  }catch(e){
+    list.innerHTML='<div class="empty">❌ خطا در بارگذاری</div>';
+  }
 }
 
+// ----- stats -----
 async function updateStats(){
-  const r=await fetch('/api/stats'); const d=await r.json();
-  document.getElementById('st-kb').textContent=d.kb;
-  document.getElementById('st-pen').textContent=d.pen;
-  document.getElementById('st-log').textContent=d.today;
+  try{
+    const r=await fetch('/api/stats');
+    const d=await r.json();
+    document.getElementById('st-kb').textContent=d.kb;
+    document.getElementById('st-pen').textContent=d.pen;
+    document.getElementById('st-log').textContent=d.today;
+  }catch(e){
+    console.log('stats error', e);
+  }
 }
-function esc(t){const d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
 
 updateStats();
-setInterval(updateStats,8000);
+setInterval(updateStats, 8000);
 </script>
 </body>
 </html>
@@ -410,6 +533,10 @@ def get_chat_session(chat_guid):
 
 @client.on_message_updates()
 async def handle_messages(update: Updates):
+    global main_loop
+    if main_loop is None:
+        main_loop = asyncio.get_running_loop()
+    
     chat_guid = getattr(update, "object_guid", "") or ""
     user_text = getattr(update, "text", None)
     author_guid = getattr(update, "author_guid", "") or ""
@@ -494,7 +621,7 @@ async def handle_messages(update: Updates):
         print(f"[AI] waiting={waiting} | {ai_text[:100]}")
 
         if waiting:
-            # ثبت توی pending (برای پنل وب)
+            # ثبت توی pending برای پنل وب
             pending_id = random.randint(100000, 999999)
             pending_replies[pending_id] = {
                 "chat_guid": chat_guid,
@@ -563,4 +690,4 @@ if __name__ == "__main__":
     print(f"🧠 KB: {len(knowledge_base)} | ⏳ Pending: {len(pending_replies)}")
     print("=" * 50)
     client.run(phone_number=os.environ.get("RUBIKA_PHONE"))
-            
+    
