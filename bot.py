@@ -14,8 +14,11 @@ logging.basicConfig(level=logging.INFO)
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # ==================== تنظیمات ====================
-OWNER_NAME = "آقای حسن‌پور"
+OWNER_NAME = "حسن"
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
+
+# اسم کلیدی که توی گروه‌ها ربات رو صدا می‌زنه
+TRIGGER_WORD = "فرایدی"
 
 BOT_PERSONA = f"""
 تو دستیار شخصی {OWNER_NAME} هستی که روی اکانت روبیکای اون فعالیت می‌کنی.
@@ -23,12 +26,12 @@ BOT_PERSONA = f"""
 جواب‌ها کوتاه و طبیعی باشن.
 
 قوانین:
-- اگه سوالی درباره {OWNER_NAME} بود و بلد بودی، مستقیم جواب بده.
+- اگه کسی اسم "{OWNER_NAME}" رو برد، منظورش صاحب اکانت ({OWNER_NAME}) هست.
+- اگه سوالی درباره {OWNER_NAME} پرسیده شد و بلد بودی، مستقیم جواب بده.
 - اگه نمی‌دونی، حتماً بگو: "از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
 - هرگز حدس نزن.
 """
 
-TRIGGER_WORD = "دستیار"
 model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
 
 # --- حافظه‌ها ---
@@ -109,7 +112,6 @@ def send_msg_sync(guid, text, reply_to=None):
             return True, result
         except Exception as e:
             print(f"[SEND FAIL] {guid}: {e}")
-            # fallback: بدون ریپلای
             try:
                 result = await client.send_message(guid, text)
                 return True, result
@@ -199,7 +201,7 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 </div>
 
 <div id="panel-kb" class="panel">
-  <input type="text" id="k-q" placeholder="سوال (مثلاً: شغلت چیه؟)">
+  <input type="text" id="k-q" placeholder="سوال (مثلاً: شغل حسن چیه؟)">
   <textarea id="k-a" placeholder="جواب..."></textarea>
   <button type="button" id="btn-add-kb">➕ ذخیره</button>
   <hr>
@@ -216,7 +218,7 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 </div>
 
 <script>
-console.log('JS loaded - v3');
+console.log('JS loaded - v4');
 
 function esc(t){const d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
 
@@ -431,7 +433,6 @@ def api_answer():
     save_pending()
     knowledge_base[original["user_text"]] = text
     save_kb()
-    # ریپلای به پیام سوال اصلی
     ok, result = send_msg_sync(original["chat_guid"], text, reply_to=original.get("message_id"))
     if ok:
         return jsonify({"ok": True})
@@ -484,7 +485,6 @@ async def handle_messages(update: Updates):
             knowledge_base[original["user_text"]] = user_text
             save_kb()
             try:
-                # ریپلای به پیام سوال اصلی
                 await client.send_message(
                     original["chat_guid"], 
                     user_text, 
@@ -493,7 +493,6 @@ async def handle_messages(update: Updates):
                 await update.reply("✅ جوابت ارسال و ذخیره شد!")
             except Exception as e:
                 print(f"[CONTROL ERROR] {e}")
-                # fallback بدون ریپلای
                 try:
                     await client.send_message(original["chat_guid"], user_text)
                     await update.reply("✅ ارسال شد (بدون ریپلای)")
@@ -551,13 +550,13 @@ async def handle_messages(update: Updates):
         print(f"[AI] waiting={waiting} | {ai_text[:100]}")
 
         if waiting:
-            # ثبت توی pending برای پنل وب + گروه کنترل
+            # ثبت توی pending
             pending_id = random.randint(100000, 999999)
             pending_replies[pending_id] = {
                 "chat_guid": chat_guid,
                 "user_text": user_text,
                 "author_guid": author_guid,
-                "message_id": message_id,  # <-- برای ریپلای زدن بعدی
+                "message_id": message_id,
                 "time": datetime.now().strftime("%H:%M:%S")
             }
             save_pending()
@@ -576,9 +575,8 @@ async def handle_messages(update: Updates):
                     sent_notif = await client.send_message(OWNER_CONTROL_GROUP, notif)
                     nid = getattr(sent_notif, "message_id", None)
                     if nid:
-                        # جایگزینی ID با ID نوتیف گروه کنترل (برای ریپلای در گروه)
                         pending_replies[nid] = pending_replies.pop(pending_id)
-                        pending_replies[nid]["message_id"] = message_id  # msg_id اصلی رو نگه دار
+                        pending_replies[nid]["message_id"] = message_id
                         save_pending()
                         print(f"[NOTIF] Sent to control group, nid={nid}")
                 except Exception as e:
@@ -611,11 +609,11 @@ async def handle_messages(update: Updates):
 if __name__ == "__main__":
     load_all()
     
-    # چک کردن شماره تلفن
+    # چک کردن متغیرهای ضروری قبل از استارت
     RUBIKA_PHONE = os.environ.get("RUBIKA_PHONE", "").strip()
     if not RUBIKA_PHONE:
-        print("❌ ERROR: RUBIKA_PHONE is not set in environment variables!")
-        print("Please set RUBIKA_PHONE in Render dashboard.")
+        print("❌ ERROR: RUBIKA_PHONE is not set!")
+        print("Please set RUBIKA_PHONE in Render dashboard → Environment.")
         exit(1)
     
     def run_web():
@@ -631,4 +629,3 @@ if __name__ == "__main__":
     print("=" * 50)
     
     client.run(phone_number=RUBIKA_PHONE)
-    
