@@ -76,7 +76,7 @@ async def reply_to_pv(update: Updates):
     try:
         await asyncio.sleep(random.uniform(5, 8))
         chat = get_chat_session(chat_guid)
-        response = chat.send_message(user_text)
+        response = await asyncio.to_thread(chat.send_message, user_text)
         if len(chat.history) > MAX_TURNS * 2:
             chat.history = chat.history[-MAX_TURNS * 2:]
         await update.reply(response.text)
