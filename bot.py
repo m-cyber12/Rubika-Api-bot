@@ -56,7 +56,7 @@ def load_json(path, default):
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"Load error {path}: {e}")
+            print(f"[LOAD ERROR] {path}: {e}")
             return default
     return default
 
@@ -64,8 +64,10 @@ def save_json(path, data):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
     except Exception as e:
-        print(f"Save error {path}: {e}")
+        print(f"[SAVE ERROR] {path}: {e}")
+        return False
 
 def load_all():
     global knowledge_base, pending_replies, chat_logs
@@ -78,21 +80,31 @@ def load_all():
         except:
             pass
     chat_logs = load_json(LOG_FILE, [])
-    print(f"Loaded: KB={len(knowledge_base)}, Pending={len(pending_replies)}, Logs={len(chat_logs)}")
+    print(f"[STARTUP] KB={len(knowledge_base)}, Pending={len(pending_replies)}, Logs={len(chat_logs)}")
 
-def save_kb(): save_json(KB_FILE, knowledge_base)
-def save_pending(): save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()})
-def save_logs(): save_json(LOG_FILE, chat_logs)
+def save_kb():
+    if save_json(KB_FILE, knowledge_base):
+        print(f"[SAVE] KB saved: {len(knowledge_base)} items")
+    else:
+        print(f"[SAVE FAIL] KB not saved!")
 
-# --- Restore Rubika session (robust: tries both upper and lower case) ---
+def save_pending():
+    ok = save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()})
+    if ok:
+        print(f"[SAVE] Pending saved: {len(pending_replies)} items")
+    else:
+        print(f"[SAVE FAIL] Pending not saved!")
+
+def save_logs():
+    save_json(LOG_FILE, chat_logs)
+
+# --- Restore Rubika session ---
 SESSION_FILE = "my_rubika_account.rp"
 
-# Try uppercase first (original names)
 part1 = os.environ.get("SESSION_B64_PART1", "")
 part2 = os.environ.get("SESSION_B64_PART2", "")
 session_b64 = part1 + part2
 
-# If empty, try lowercase
 if not session_b64:
     part1 = os.environ.get("session_b64_part1", "")
     part2 = os.environ.get("session_b64_part2", "")
@@ -109,9 +121,9 @@ if session_b64 and not os.path.exists(SESSION_FILE):
     except Exception as e:
         print(f"[SESSION] Restore error: {e}")
 elif os.path.exists(SESSION_FILE):
-    print(f"[SESSION] File already exists: {os.path.getsize(SESSION_FILE)} bytes")
+    print(f"[SESSION] File exists: {os.path.getsize(SESSION_FILE)} bytes")
 else:
-    print("[SESSION] No session env vars found! Bot will ask for phone number.")
+    print("[SESSION] No session env vars found!")
 
 client = Client(name="my_rubika_account")
 
@@ -237,7 +249,7 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 </div>
 
 <script>
-console.log('JS loaded - v4');
+console.log('JS loaded - v5');
 
 function esc(t){const d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
 
@@ -377,7 +389,7 @@ async function updateStats(){
 }
 
 updateStats();
-setInterval(updateStats,8000);
+setInterval(updateStats,5000);
 </script>
 </body>
 </html>
@@ -478,7 +490,13 @@ async def handle_messages(update: Updates):
     chat_guid = getattr(update, "object_guid", "") or ""
     user_text = getattr(update, "text", None)
     author_guid = getattr(update, "author_guid", "") or ""
-    message_id = getattr(update, "message_id", None)
+    raw_msg_id = getattr(update, "message_id", None)
+    
+    # تبدیل message_id به int برای JSON-safe بودن
+    try:
+        message_id = int(raw_msg_id) if raw_msg_id is not None else None
+    except:
+        message_id = None
     
     if not user_text:
         return
@@ -571,15 +589,17 @@ async def handle_messages(update: Updates):
         if waiting:
             # ثبت توی pending
             pending_id = random.randint(100000, 999999)
-            pending_replies[pending_id] = {
+            pending_item = {
                 "chat_guid": chat_guid,
                 "user_text": user_text,
                 "author_guid": author_guid,
                 "message_id": message_id,
                 "time": datetime.now().strftime("%H:%M:%S")
             }
+            pending_replies[pending_id] = pending_item
+            print(f"[PENDING] Adding id={pending_id}, msg_id={message_id}")
             save_pending()
-            print(f"[PENDING] Saved id={pending_id}, msg_id={message_id}")
+            print(f"[PENDING] Saved to file. Total pending: {len(pending_replies)}")
 
             # نوتیف گروه کنترل (اگه ست شده باشه)
             if OWNER_CONTROL_GROUP:
@@ -595,7 +615,10 @@ async def handle_messages(update: Updates):
                     nid = getattr(sent_notif, "message_id", None)
                     if nid:
                         pending_replies[nid] = pending_replies.pop(pending_id)
-                        pending_replies[nid]["message_id"] = message_id
+                        try:
+                            pending_replies[nid]["message_id"] = message_id
+                        except:
+                            pass
                         save_pending()
                         print(f"[NOTIF] Sent to control group, nid={nid}")
                 except Exception as e:
@@ -607,6 +630,7 @@ async def handle_messages(update: Updates):
                 sid = getattr(sent, "message_id", None)
                 if sid:
                     bot_sent_message_ids.add(sid)
+                print("[REPLY] Wait message sent to user")
             except Exception as e:
                 print(f"[REPLY ERROR] {e}")
         else:
@@ -640,7 +664,6 @@ if __name__ == "__main__":
     print(f"🧠 KB: {len(knowledge_base)} | ⏳ Pending: {len(pending_replies)}")
     print("=" * 50)
     
-    # اگه سشن موجود باشه، نیازی به شماره نیست
     RUBIKA_PHONE = os.environ.get("RUBIKA_PHONE") or os.environ.get("rubika_phone")
     if RUBIKA_PHONE:
         print(f"📱 Using phone: {RUBIKA_PHONE[:6]}...")
@@ -648,3 +671,4 @@ if __name__ == "__main__":
     else:
         print("📱 No phone number set, trying session auth...")
         client.run()
+        
