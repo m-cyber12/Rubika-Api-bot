@@ -4,6 +4,7 @@ import threading
 import random
 import logging
 import json
+import re
 from datetime import datetime
 from rubpy import Client
 from rubpy.types import Updates
@@ -11,13 +12,32 @@ import google.generativeai as genai
 from flask import Flask, request, jsonify, render_template_string
 
 logging.basicConfig(level=logging.INFO)
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+
+# ==================== چند کلید API ====================
+api_keys_str = os.environ.get("GEMINI_API_KEYS", os.environ.get("GEMINI_API_KEY", ""))
+api_keys = [k.strip() for k in api_keys_str.split(",") if k.strip()]
+if not api_keys:
+    print("❌ ERROR: No Gemini API keys found! Set GEMINI_API_KEYS or GEMINI_API_KEY")
+    exit(1)
+
+def pick_key():
+    return random.choice(api_keys)
+
+genai.configure(api_key=pick_key())
 
 # ==================== تنظیمات ====================
 OWNER_NAME = "حسن"
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
 
 TRIGGER_WORD = "فرایدی"
+
+def get_persian_year():
+    now = datetime.now()
+    if now.month > 3 or (now.month == 3 and now.day >= 21):
+        return now.year - 621
+    return now.year - 622
+
+PERSIAN_YEAR = get_persian_year()
 
 BOT_PERSONA = f"""
 تو دستیار شخصی {OWNER_NAME} هستی که روی اکانت روبیکای اون فعالیت می‌کنی.
@@ -29,6 +49,7 @@ BOT_PERSONA = f"""
 - اگه سوالی درباره {OWNER_NAME} پرسیده شد و بلد بودی، مستقیم جواب بده.
 - اگه نمی‌دونی، حتماً بگو: "از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
 - هرگز حدس نزن.
+- اگه کسی از سن یا سال یا تولد پرسید، با توجه به تاریخ امروز حساب کن و فقط عدد سن رو بگو.
 """
 
 model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
@@ -85,15 +106,11 @@ def load_all():
 def save_kb():
     if save_json(KB_FILE, knowledge_base):
         print(f"[SAVE] KB saved: {len(knowledge_base)} items")
-    else:
-        print(f"[SAVE FAIL] KB not saved!")
 
 def save_pending():
     ok = save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()})
     if ok:
         print(f"[SAVE] Pending saved: {len(pending_replies)} items")
-    else:
-        print(f"[SAVE FAIL] Pending not saved!")
 
 def save_logs():
     save_json(LOG_FILE, chat_logs)
@@ -249,7 +266,7 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
 </div>
 
 <script>
-console.log('JS loaded - v5');
+console.log('JS loaded - v6');
 
 function esc(t){const d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
 
@@ -412,7 +429,8 @@ def api_chat():
     if not msg:
         return jsonify({"error": "Empty"}), 400
     try:
-        chat = model.start_chat(history=[])
+        genai.configure(api_key=pick_key())
+        chat = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA).start_chat(history=[])
         res = chat.send_message(msg)
         return jsonify({"reply": res.text})
     except Exception as e:
@@ -481,6 +499,10 @@ def get_chat_session(chat_guid):
         chat_histories[chat_guid] = model.start_chat(history=[])
     return chat_histories[chat_guid]
 
+def is_age_question(text):
+    keywords = ["چند سال", "سن", "سالش", "عمر", "قدیمی", "تولد", "متولد"]
+    return any(kw in text for kw in keywords)
+
 @client.on_message_updates()
 async def handle_messages(update: Updates):
     global main_loop
@@ -492,7 +514,6 @@ async def handle_messages(update: Updates):
     author_guid = getattr(update, "author_guid", "") or ""
     raw_msg_id = getattr(update, "message_id", None)
     
-    # تبدیل message_id به int برای JSON-safe بودن
     try:
         message_id = int(raw_msg_id) if raw_msg_id is not None else None
     except:
@@ -557,14 +578,17 @@ async def handle_messages(update: Updates):
     print(f"[MSG] {chat_guid} (pv={is_private}): {user_text[:80]}")
 
     # ۳. بررسی Knowledge Base
-    if user_text in knowledge_base:
+    kb_answer = knowledge_base.get(user_text)
+    
+    # اگه سوال درباره سن/سالشه باشه، نریم سراغ جواب مستقیم KB. بذار AI با تاریخ امروز حساب کنه
+    if kb_answer and not is_age_question(user_text) and not is_age_question(kb_answer):
         try:
             await asyncio.sleep(random.uniform(1, 3))
-            sent = await update.reply(knowledge_base[user_text])
+            sent = await update.reply(kb_answer)
             sid = getattr(sent, "message_id", None)
             if sid:
                 bot_sent_message_ids.add(sid)
-            print("[KB] Replied from knowledge")
+            print("[KB] Direct reply from knowledge")
         except Exception as e:
             print(f"[KB ERROR] {e}")
         return
@@ -572,15 +596,23 @@ async def handle_messages(update: Updates):
     # ۴. AI
     try:
         await asyncio.sleep(random.uniform(3, 6))
-        chat = get_chat_session(chat_guid)
         
+        # ساخت context
         kb_ctx = ""
         if knowledge_base:
-            kb_ctx = "\nاطلاعات شناخته شده:\n"
+            kb_ctx = "\nاطلاعات شناخته شده درباره صاحب اکانت:\n"
             for q, a in list(knowledge_base.items())[-5:]:
                 kb_ctx += f"- {q}: {a}\n"
         
-        response = await chat.send_message_async(user_text + kb_ctx)
+        date_ctx = f"\nتاریخ امروز: سال {PERSIAN_YEAR} شمسی (تقریبی).\n"
+        
+        full_prompt = user_text + date_ctx + kb_ctx
+        
+        # چرخش کلید API
+        genai.configure(api_key=pick_key())
+        chat = get_chat_session(chat_guid)
+        
+        response = await chat.send_message_async(full_prompt)
         ai_text = response.text
 
         waiting = any(p in ai_text for p in ["می‌پرسم", "ازش می‌پرسم", "بپرسم", "نمی‌دونم", "نمی‌دانم", "نمی دونم", "اطلاع ندارم"])
@@ -599,7 +631,6 @@ async def handle_messages(update: Updates):
             pending_replies[pending_id] = pending_item
             print(f"[PENDING] Adding id={pending_id}, msg_id={message_id}")
             save_pending()
-            print(f"[PENDING] Saved to file. Total pending: {len(pending_replies)}")
 
             # نوتیف گروه کنترل (اگه ست شده باشه)
             if OWNER_CONTROL_GROUP:
@@ -630,7 +661,6 @@ async def handle_messages(update: Updates):
                 sid = getattr(sent, "message_id", None)
                 if sid:
                     bot_sent_message_ids.add(sid)
-                print("[REPLY] Wait message sent to user")
             except Exception as e:
                 print(f"[REPLY ERROR] {e}")
         else:
@@ -662,6 +692,7 @@ if __name__ == "__main__":
     print(f"📊 URL: https://your-app.onrender.com/")
     print(f"📬 Control Group: {OWNER_CONTROL_GROUP or 'OFF (فقط پنل)'}")
     print(f"🧠 KB: {len(knowledge_base)} | ⏳ Pending: {len(pending_replies)}")
+    print(f"🔑 API Keys: {len(api_keys)} loaded")
     print("=" * 50)
     
     RUBIKA_PHONE = os.environ.get("RUBIKA_PHONE") or os.environ.get("rubika_phone")
