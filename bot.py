@@ -5,6 +5,7 @@ import random
 import logging
 import json
 import re
+import shutil
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from rubpy import Client
@@ -58,32 +59,41 @@ MAX_TURNS = 10
 bot_sent_message_ids = set()
 
 KB_FILE = "knowledge_base.json"
-knowledge_base = {}
-
 PENDING_FILE = "pending_replies.json"
-pending_replies = {}
-
 LOG_FILE = "chat_log.json"
+
+knowledge_base = {}
+pending_replies = {}
 chat_logs = []
 
 main_loop = None
 executor = ThreadPoolExecutor(max_workers=4)
 
-# --- Load/Save ---
-def load_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"[LOAD ERROR] {path}: {e}")
-            return default
-    return default
-
-def save_json(path, data):
+# ==================== توابع کمکی برای فایل ====================
+def safe_load_json(path, default):
+    if not os.path.exists(path):
+        return default
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[LOAD ERROR] {path}: {e}")
+        # ایجاد بک‌آپ از فایل خراب
+        try:
+            backup = path + ".corrupt"
+            shutil.copy(path, backup)
+            print(f"[BACKUP] Corrupt file saved as {backup}")
+        except:
+            pass
+        return default
+
+def safe_save_json(path, data):
+    try:
+        # ابتدا در یک فایل موقت بنویسیم
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)  # atomic operation
         return True
     except Exception as e:
         print(f"[SAVE ERROR] {path}: {e}")
@@ -91,28 +101,27 @@ def save_json(path, data):
 
 def load_all():
     global knowledge_base, pending_replies, chat_logs
-    knowledge_base = load_json(KB_FILE, {})
-    pending_raw = load_json(PENDING_FILE, {})
+    knowledge_base = safe_load_json(KB_FILE, {})
+    pending_raw = safe_load_json(PENDING_FILE, {})
     pending_replies = {}
     for k, v in pending_raw.items():
         try:
             pending_replies[int(k)] = v
         except:
             pass
-    chat_logs = load_json(LOG_FILE, [])
+    chat_logs = safe_load_json(LOG_FILE, [])
     print(f"[STARTUP] KB={len(knowledge_base)}, Pending={len(pending_replies)}, Logs={len(chat_logs)}")
 
 def save_kb():
-    if save_json(KB_FILE, knowledge_base):
+    if safe_save_json(KB_FILE, knowledge_base):
         print(f"[SAVE] KB: {len(knowledge_base)} items")
 
 def save_pending():
-    ok = save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()})
-    if ok:
+    if safe_save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()}):
         print(f"[SAVE] Pending: {len(pending_replies)} items")
 
 def save_logs():
-    save_json(LOG_FILE, chat_logs)
+    safe_save_json(LOG_FILE, chat_logs)
 
 # --- Restore Rubika session ---
 SESSION_FILE = "my_rubika_account.rp"
@@ -143,8 +152,46 @@ else:
 
 client = Client(name="my_rubika_account")
 
-# ==================== HELPER ====================
+# ==================== توابع کمکی برای ارسال و شناسایی ریپلای ====================
+async def send_and_track(guid, text, reply_to=None):
+    """ارسال پیام و ثبت message_id در set برای تشخیص ریپلای"""
+    try:
+        if reply_to:
+            sent = await client.send_message(guid, text, reply_to_message_id=reply_to)
+        else:
+            sent = await client.send_message(guid, text)
+        
+        # استخراج message_id به روش‌های مختلف
+        msg_id = None
+        if hasattr(sent, 'message_id'):
+            msg_id = sent.message_id
+        elif isinstance(sent, dict) and 'message_id' in sent:
+            msg_id = sent['message_id']
+        elif hasattr(sent, 'id'):
+            msg_id = sent.id
+        elif hasattr(sent, 'Message') and hasattr(sent.Message, 'message_id'):
+            msg_id = sent.Message.message_id
+
+        if msg_id:
+            bot_sent_message_ids.add(msg_id)
+            print(f"[TRACK] Added message_id {msg_id} for {guid}")
+        else:
+            print(f"[TRACK] Could not extract message_id from {sent}")
+        return sent
+    except Exception as e:
+        print(f"[SEND ERROR] {e}")
+        raise
+
+def get_reply_to_id(update):
+    """استخراج شناسه پیام مرجع از اشیاء update با نام‌های مختلف"""
+    for attr in ['reply_to_message_id', 'reply_message_id', 'reply_to_msg_id']:
+        val = getattr(update, attr, None)
+        if val is not None:
+            return val
+    return None
+
 def send_msg_sync(guid, text, reply_to=None):
+    """نسخه همگام برای استفاده از پنل فلاسک"""
     if not guid or not text:
         return False, "Empty"
     if main_loop is None:
@@ -152,22 +199,16 @@ def send_msg_sync(guid, text, reply_to=None):
     
     async def _send():
         try:
-            if reply_to:
-                result = await client.send_message(guid, text, reply_to_message_id=reply_to)
-            else:
-                result = await client.send_message(guid, text)
-            return True, result
+            return await send_and_track(guid, text, reply_to)
         except Exception as e:
-            print(f"[SEND FAIL] {guid}: {e}")
-            try:
-                result = await client.send_message(guid, text)
-                return True, result
-            except Exception as e2:
-                return False, str(e2)
+            return None
     
     try:
         future = asyncio.run_coroutine_threadsafe(_send(), main_loop)
-        return future.result(timeout=15)
+        result = future.result(timeout=15)
+        if result:
+            return True, "OK"
+        return False, "Send failed"
     except Exception as e:
         return False, str(e)
 
@@ -476,7 +517,6 @@ def api_kb():
 def api_pending():
     return jsonify({"pending": {str(k): v for k, v in pending_replies.items()}})
 
-# جواب از پنل → فقط KB ذخیره، ارسال نمی‌شه
 @app.route("/api/answer", methods=["POST"])
 def api_answer():
     data = request.get_json() or {}
@@ -497,7 +537,7 @@ def api_answer():
 def api_logs():
     return jsonify({"logs": chat_logs})
 
-# ==================== قسمت ۲: ربات روبیکا ====================
+    # ==================== قسمت ۲: ربات روبیکا ====================
 def get_chat_session(chat_guid):
     if chat_guid not in chat_histories:
         chat_histories[chat_guid] = model.start_chat(history=[])
@@ -544,13 +584,14 @@ async def handle_messages(update: Updates):
 
     # ۱. گروه کنترل (اگه ست شده باشه)
     if OWNER_CONTROL_GROUP and chat_guid == OWNER_CONTROL_GROUP:
-        reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
+        reply_to = get_reply_to_id(update)
         if reply_to and reply_to in pending_replies:
             original = pending_replies.pop(reply_to)
             save_pending()
             knowledge_base[original["user_text"]] = user_text
             save_kb()
-            await update.reply("✅ جوابت ذخیره شد توی دانش.")
+            # ارسال تایید با تابع track
+            await send_and_track(chat_guid, "✅ جوابت ذخیره شد توی دانش.")
             return
         return
 
@@ -560,7 +601,7 @@ async def handle_messages(update: Updates):
         if author_guid and author_guid != chat_guid:
             return
     else:
-        reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
+        reply_to = get_reply_to_id(update)
         is_reply_to_bot = reply_to is not None and reply_to in bot_sent_message_ids
         if TRIGGER_WORD not in user_text and not is_reply_to_bot:
             return
@@ -569,6 +610,7 @@ async def handle_messages(update: Updates):
             user_text = "سلام"
 
     print(f"\n[MSG] {chat_guid} (pv={is_private}): {user_text[:80]}")
+    print(f"[DEBUG] bot_sent_message_ids = {bot_sent_message_ids}")
 
     # ۳. بررسی Knowledge Base
     kb_answer = knowledge_base.get(user_text)
@@ -576,10 +618,7 @@ async def handle_messages(update: Updates):
     if kb_answer and not is_age_question(user_text) and not is_age_question(kb_answer):
         try:
             await asyncio.sleep(random.uniform(1, 3))
-            sent = await update.reply(kb_answer)
-            sid = getattr(sent, "message_id", None)
-            if sid:
-                bot_sent_message_ids.add(sid)
+            sent = await send_and_track(chat_guid, kb_answer, reply_to=message_id)
             print("[KB] Direct reply")
             return
         except Exception as e:
@@ -600,12 +639,10 @@ async def handle_messages(update: Updates):
         
         print(f"[AI] Sending prompt... ({len(full_prompt)} chars)")
         
-        # ساخت model با کلید رندوم
         genai.configure(api_key=pick_key())
         m = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
         chat = m.start_chat(history=[])
         
-        # ارسال sync توی thread جداگانه (stable‌تر)
         def _ai_send():
             return chat.send_message(full_prompt)
         
@@ -614,20 +651,17 @@ async def handle_messages(update: Updates):
         ai_text = response.text
         print(f"[AI RAW] {ai_text[:120]}")
 
-        # تشخیص waiting
         waiting = False
         if any(re.search(p, ai_text) for p in [r"می[‌\s]?پرسم", r"بپرسم", r"نمی[‌\s]?دانم", r"نمی[‌\s]?دونم", r"نمیدونم", r"اطلاع[ات\s]+ندارم", r"مطمئن\s+نیستم"]):
             waiting = True
             print("[AI] Detected waiting phrase")
         
-        # fallback: سوال درباره حسن بدون جواب KB
         if not waiting and is_about_owner(user_text) and not kb_answer:
             waiting = True
             ai_text = f"از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
             print("[FALLBACK] Owner question, no KB -> pending")
 
         if waiting:
-            # ثبت pending
             pending_id = random.randint(100000, 999999)
             pending_replies[pending_id] = {
                 "chat_guid": chat_guid,
@@ -637,38 +671,41 @@ async def handle_messages(update: Updates):
                 "time": datetime.now().strftime("%H:%M:%S")
             }
             save_pending()
-            print(f"[PENDING] id={pending_id}")
+            print(f"[PENDING] id={pending_id}, total={len(pending_replies)}")
 
-            # نوتیف گروه کنترل
             if OWNER_CONTROL_GROUP:
                 try:
                     notif = f"❓ سوال جدید\n🆔 {chat_guid}\n\n💬 {user_text}\n\n🤖 {ai_text}\n\n⬅️ ریپلای کن تا ذخیره کنم"
-                    sent_notif = await client.send_message(OWNER_CONTROL_GROUP, notif)
-                    nid = getattr(sent_notif, "message_id", None)
+                    sent_notif = await send_and_track(OWNER_CONTROL_GROUP, notif)
+                    # جایگزینی id pending با id پیام نوتیف
+                    nid = None
+                    if hasattr(sent_notif, 'message_id'):
+                        nid = sent_notif.message_id
+                    elif isinstance(sent_notif, dict) and 'message_id' in sent_notif:
+                        nid = sent_notif['message_id']
+                    elif hasattr(sent_notif, 'id'):
+                        nid = sent_notif.id
                     if nid:
                         pending_replies[nid] = pending_replies.pop(pending_id)
                         pending_replies[nid]["message_id"] = message_id
                         save_pending()
+                        print(f"[PENDING] Mapped to notification id {nid}")
                 except Exception as e:
                     print(f"[NOTIF ERROR] {e}")
 
-            # پیام "منتظر" به کاربر
             try:
-                sent = await update.reply(ai_text)
-                if getattr(sent, "message_id", None):
-                    bot_sent_message_ids.add(sent.message_id)
+                sent = await send_and_track(chat_guid, ai_text, reply_to=message_id)
+                print("[AI] Pending reply sent")
             except Exception as e:
                 print(f"[REPLY ERROR] {e}")
         else:
-            sent = await update.reply(ai_text)
-            if getattr(sent, "message_id", None):
-                bot_sent_message_ids.add(sent.message_id)
+            sent = await send_and_track(chat_guid, ai_text, reply_to=message_id)
             print("[AI] Direct reply sent")
 
     except Exception as e:
         print(f"[AI ERROR] {e}")
         try:
-            await update.reply("یه مشکلی پیش اومد، دوباره امتحان کن 😅")
+            await send_and_track(chat_guid, "یه مشکلی پیش اومد، دوباره امتحان کن 😅", reply_to=message_id)
         except:
             pass
 
@@ -696,4 +733,3 @@ if __name__ == "__main__":
     else:
         print("📱 Session auth...")
         client.run()
-        
