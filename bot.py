@@ -630,12 +630,19 @@ async def handle_messages(update: Updates):
         ai_text = response.text
         print(f"[AI] پاسخ: {ai_text[:150]}")
 
-        # تشخیص دقیق‌تر بر اساس جمله‌ی مشخص
-        waiting = "از حسن می‌پرسم" in ai_text or "از حسن می‌پرسم و بهت می‌گم" in ai_text
+        # ===== تشخیص waiting (اصلاح‌شده) =====
+        waiting = False
         
-        # اگر هر کلمه‌ی دیگری از "نمی‌دونم" استفاده کرد، باز هم waiting در نظر بگیر
-        if not waiting:
-            waiting = any(p in ai_text for p in ["نمی‌دونم", "نمی‌دانم", "نمی دونم", "اطلاع ندارم"])
+        # ۱. حذف ایموجی‌ها و فاصله‌های اضافی
+        clean_text = ai_text.replace("😊", "").replace("❤️", "").replace("✨", "").strip()
+        
+        # ۲. بررسی عبارت اصلی
+        if "از حسن می‌پرسم" in clean_text or "از حسن می‌پرسم و بهت می‌گم" in clean_text:
+            waiting = True
+        else:
+            # ۳. بررسی کلمات کلیدی
+            waiting_keywords = ["نمی‌دونم", "نمی‌دانم", "نمی دونم", "اطلاع ندارم", "می‌پرسم", "ازش می‌پرسم", "بپرسم"]
+            waiting = any(kw in ai_text for kw in waiting_keywords)
         
         print(f"[AI] waiting={waiting}")
 
