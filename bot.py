@@ -583,23 +583,98 @@ async def handle_messages(update: Updates):
                 await update.reply(f"❌ خطا در ارسال: {e}")
             return
 
-    # ===== فیلتر پیام =====
-    is_private = chat_guid.startswith("u0")
-    if is_private:
-        if author_guid and author_guid != chat_guid:
-            return
-    else:
+@client.on_message_updates()
+async def handle_messages(update: Updates):
+    global main_loop
+    if main_loop is None:
+        main_loop = asyncio.get_running_loop()
+    
+    chat_guid = getattr(update, "object_guid", "") or ""
+    user_text = getattr(update, "text", None)
+    author_guid = getattr(update, "author_guid", "") or ""
+    raw_msg_id = getattr(update, "message_id", None)
+    
+    try:
+        message_id = int(raw_msg_id) if raw_msg_id is not None else None
+    except (ValueError, TypeError):
+        message_id = None
+    
+    if not user_text:
+        return
+
+    chat_logs.append({
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "guid": chat_guid,
+        "from": author_guid or "unknown",
+        "text": user_text[:200]
+    })
+    if len(chat_logs) > 1000:
+        chat_logs.pop(0)
+    save_logs()
+
+    # ===== گروه کنترل (فقط برای پاسخ‌های شما) =====
+    if OWNER_CONTROL_GROUP and chat_guid == OWNER_CONTROL_GROUP:
         reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
         reply_str = str(reply_to) if reply_to is not None else None
-        is_reply_to_bot = reply_str is not None and reply_str in bot_sent_message_ids
-        if not is_reply_to_bot and TRIGGER_WORD not in user_text:
+        if reply_str and reply_str in pending_replies:
+            original = pending_replies.pop(reply_str)
+            save_pending()
+            knowledge_base[original["user_text"]] = user_text
+            save_kb()
+            try:
+                chat = model.start_chat(history=[])
+                prompt = f"""
+                کاربر این سوال را پرسیده بود: "{original['user_text']}"
+                من (صاحب ربات) این پاسخ را به تو می‌دهم: "{user_text}"
+                حالا تو به‌عنوان دستیار، این پاسخ را با لحن خودت و به‌صورت کامل و دوستانه به کاربر بگو.
+                پاسخ را فقط به فارسی و کوتاه اما کامل بگو.
+                """
+                response = chat.send_message(prompt)
+                final_answer = response.text
+            except Exception as e:
+                final_answer = user_text
+                print(f"[AI ERROR in control] {e}")
+            try:
+                await client.send_message(
+                    original["chat_guid"], 
+                    final_answer, 
+                    reply_to_message_id=original.get("message_id")
+                )
+                await update.reply("✅ پاسخ با موفقیت ارسال شد!")
+            except Exception as e:
+                pending_replies[reply_str] = original
+                save_pending()
+                await update.reply(f"❌ خطا در ارسال: {e}")
             return
-        if TRIGGER_WORD in user_text:
-            user_text = user_text.replace(TRIGGER_WORD, "", 1).strip()
+
+    # ===== فیلتر پیام =====
+is_private = chat_guid.startswith("u0")
+if is_private:
+    if author_guid and author_guid != chat_guid:
+        return
+else:
+    reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
+    reply_str = str(reply_to) if reply_to is not None else None
+    is_reply_to_bot = reply_str is not None and reply_str in bot_sent_message_ids
+    
+    # اگر ریپلای به ربات نیست و کلمه کلیدی هم نداره، نادیده بگیر
+    if not is_reply_to_bot and TRIGGER_WORD not in user_text:
+        return
+    
+    # اگر کلمه کلیدی داشت، از متن پاکش کن
+    if TRIGGER_WORD in user_text:
+        user_text = user_text.replace(TRIGGER_WORD, "", 1).strip()
         if not user_text:
             user_text = "سلام"
+        
+        # ===== اینجا: اگر ریپلای به ربات نبود، تاریخچه رو ریست کن =====
+        if not is_reply_to_bot:
+            # شروع یه بحث جدید
+            chat_histories[chat_guid] = model.start_chat(history=[])
+            print(f"[NEW SESSION] تاریخچه برای {chat_guid} ریست شد")
 
-    print(f"[MSG] chat={chat_guid}, private={is_private}, text={user_text[:80]}")
+    print(f"[MSG] chat={chat_guid}, private={is_private}, reply_to_bot={is_reply_to_bot}, text={user_text[:80]}")
 
     # ===== دانش =====
     if user_text in knowledge_base:
@@ -618,7 +693,7 @@ async def handle_messages(update: Updates):
     # ===== AI =====
     try:
         await asyncio.sleep(random.uniform(3, 6))
-        chat = get_chat_session(chat_guid)
+        chat = get_chat_session(chat_guid)  # این الان یا session قدیم رو می‌ده یا جدید
         
         kb_ctx = ""
         if knowledge_base:
@@ -630,17 +705,12 @@ async def handle_messages(update: Updates):
         ai_text = response.text
         print(f"[AI] پاسخ: {ai_text[:150]}")
 
-        # ===== تشخیص waiting (اصلاح‌شده) =====
+        # تشخیص waiting (با حذف ایموجی)
         waiting = False
-        
-        # ۱. حذف ایموجی‌ها و فاصله‌های اضافی
         clean_text = ai_text.replace("😊", "").replace("❤️", "").replace("✨", "").strip()
-        
-        # ۲. بررسی عبارت اصلی
         if "از حسن می‌پرسم" in clean_text or "از حسن می‌پرسم و بهت می‌گم" in clean_text:
             waiting = True
         else:
-            # ۳. بررسی کلمات کلیدی
             waiting_keywords = ["نمی‌دونم", "نمی‌دانم", "نمی دونم", "اطلاع ندارم", "می‌پرسم", "ازش می‌پرسم", "بپرسم"]
             waiting = any(kw in ai_text for kw in waiting_keywords)
         
@@ -658,7 +728,6 @@ async def handle_messages(update: Updates):
             pending_replies[pending_id] = pending_item
             print(f"[PENDING] اضافه شد id={pending_id}, msg_id={message_id}, text={user_text}")
             save_pending()
-            print(f"[PENDING] مجموع pending: {len(pending_replies)}")
 
             try:
                 sent = await update.reply(ai_text)
