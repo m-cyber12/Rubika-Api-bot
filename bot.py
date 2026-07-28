@@ -139,12 +139,22 @@ def send_msg_sync(guid, text, reply_to=None):
     if main_loop is None:
         return False, "Bot not ready yet"
     
+    # تبدیل reply_to به عدد اگر رشته بود
+    if reply_to is not None:
+        try:
+            reply_to = int(reply_to)
+        except (ValueError, TypeError):
+            reply_to = None
+            print(f"[WARN] reply_to is not a number: {reply_to}")
+    
     async def _send():
         try:
             if reply_to:
                 result = await client.send_message(guid, text, reply_to_message_id=reply_to)
+                print(f"[SEND] با ریپلای به message_id={reply_to}")
             else:
                 result = await client.send_message(guid, text)
+                print(f"[SEND] بدون ریپلای")
             return True, result
         except Exception as e:
             print(f"[SEND FAIL] {guid}: {e}")
@@ -490,8 +500,9 @@ def api_answer():
         final_answer = text
         print(f"[AI ERROR in answer] {e}")
 
-    # ارسال پاسخ نهایی به کاربر
-    ok, result = send_msg_sync(original["chat_guid"], final_answer, reply_to=original.get("message_id"))
+    # ارسال پاسخ نهایی به کاربر با ریپلای
+    reply_to_id = original.get("message_id")
+    ok, result = send_msg_sync(original["chat_guid"], final_answer, reply_to=reply_to_id)
     if ok:
         return jsonify({"ok": True})
     else:
@@ -520,9 +531,10 @@ async def handle_messages(update: Updates):
     author_guid = getattr(update, "author_guid", "") or ""
     raw_msg_id = getattr(update, "message_id", None)
     
+    # ذخیره message_id به‌صورت عدد (یا None)
     try:
-        message_id = str(raw_msg_id).strip() if raw_msg_id is not None and str(raw_msg_id).strip() != "None" else None
-    except:
+        message_id = int(raw_msg_id) if raw_msg_id is not None else None
+    except (ValueError, TypeError):
         message_id = None
     
     if not user_text:
@@ -564,13 +576,14 @@ async def handle_messages(update: Updates):
             except Exception as e:
                 final_answer = user_text
                 print(f"[AI ERROR in control] {e}")
-            # ارسال به کاربر
+            # ارسال به کاربر با ریپلای
             try:
                 await client.send_message(
                     original["chat_guid"], 
                     final_answer, 
                     reply_to_message_id=original.get("message_id")
                 )
+                print(f"[CONTROL] پاسخ با ریپلای به message_id={original.get('message_id')} ارسال شد")
                 await update.reply("✅ پاسخ با موفقیت ارسال شد!")
             except Exception as e:
                 pending_replies[reply_str] = original
@@ -627,13 +640,13 @@ async def handle_messages(update: Updates):
         print(f"[AI] waiting={waiting} | {ai_text[:100]}")
 
         if waiting:
-            # ثبت توی pending
+            # ثبت توی pending با message_id عددی
             pending_id = str(random.randint(100000, 999999))
             pending_item = {
                 "chat_guid": chat_guid,
                 "user_text": user_text,
                 "author_guid": author_guid,
-                "message_id": message_id,
+                "message_id": message_id,  # حالا عدد است یا None
                 "time": datetime.now().strftime("%H:%M:%S")
             }
             pending_replies[pending_id] = pending_item
