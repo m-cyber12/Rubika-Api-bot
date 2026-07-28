@@ -15,7 +15,6 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # ==================== تنظیمات ====================
 OWNER_NAME = "حسن"
-# متغیر زیر دیگر استفاده نمی‌شود، ولی برای سازگاری با کدهای قدیمی نگه‌داری شد
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
 
 TRIGGER_WORD = "فرایدی"
@@ -45,8 +44,6 @@ knowledge_base = {}
 PENDING_FILE = "pending_replies.json"
 pending_replies = {}
 BOT_SENT_FILE = "bot_sent_ids.json"
-
-
 
 LOG_FILE = "chat_log.json"
 chat_logs = []
@@ -478,7 +475,7 @@ def api_answer():
     knowledge_base[original["user_text"]] = text
     save_kb()
 
-    # ====== مرحله‌ی جدید: تولید پاسخ توسط AI ======
+    # ====== تولید پاسخ توسط AI ======
     try:
         chat = model.start_chat(history=[])
         prompt = f"""
@@ -490,7 +487,6 @@ def api_answer():
         response = chat.send_message(prompt)
         final_answer = response.text
     except Exception as e:
-        # اگر AI خطا داد، همان جواب مستقیم رو بفرست
         final_answer = text
         print(f"[AI ERROR in answer] {e}")
 
@@ -499,16 +495,15 @@ def api_answer():
     if ok:
         return jsonify({"ok": True})
     else:
-        # اگر ارسال ناموفق بود، دوباره به pending برگردان
         pending_replies[pid] = original
         save_pending()
         return jsonify({"error": result}), 500
-        
+
 @app.route("/api/logs")
 def api_logs():
     return jsonify({"logs": chat_logs})
 
-    # ==================== قسمت ۲: ربات روبیکا ====================
+# ==================== قسمت ۲: ربات روبیکا ====================
 def get_chat_session(chat_guid):
     if chat_guid not in chat_histories:
         chat_histories[chat_guid] = model.start_chat(history=[])
@@ -545,9 +540,45 @@ async def handle_messages(update: Updates):
         chat_logs.pop(0)
     save_logs()
 
-    # ===== حذف شد: بخش مربوط به OWNER_CONTROL_GROUP =====
+    # ===== بخش گروه کنترل (فقط برای دریافت پاسخ‌های شما) =====
+    if OWNER_CONTROL_GROUP and chat_guid == OWNER_CONTROL_GROUP:
+        reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
+        reply_str = str(reply_to) if reply_to is not None else None
+        if reply_str and reply_str in pending_replies:
+            original = pending_replies.pop(reply_str)
+            save_pending()
+            # ذخیره در دانش
+            knowledge_base[original["user_text"]] = user_text
+            save_kb()
+            # ====== تولید پاسخ توسط AI ======
+            try:
+                chat = model.start_chat(history=[])
+                prompt = f"""
+                کاربر این سوال را پرسیده بود: "{original['user_text']}"
+                من (صاحب ربات) این پاسخ را به تو می‌دهم: "{user_text}"
+                حالا تو به‌عنوان دستیار، این پاسخ را با لحن خودت و به‌صورت کامل و دوستانه به کاربر بگو.
+                پاسخ را فقط به فارسی و کوتاه اما کامل بگو.
+                """
+                response = chat.send_message(prompt)
+                final_answer = response.text
+            except Exception as e:
+                final_answer = user_text
+                print(f"[AI ERROR in control] {e}")
+            # ارسال به کاربر
+            try:
+                await client.send_message(
+                    original["chat_guid"], 
+                    final_answer, 
+                    reply_to_message_id=original.get("message_id")
+                )
+                await update.reply("✅ پاسخ با موفقیت ارسال شد!")
+            except Exception as e:
+                pending_replies[reply_str] = original
+                save_pending()
+                await update.reply(f"❌ خطا در ارسال: {e}")
+            return  # دیگر ادامه نمی‌دهیم
 
-    # ۲. فیلتر پیام عادی
+    # ۲. فیلتر پیام عادی (غیر از گروه کنترل)
     is_private = chat_guid.startswith("u0")
     if is_private:
         if author_guid and author_guid != chat_guid:
@@ -651,7 +682,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("🚀 Bot + Dashboard running")
     print(f"📊 URL: https://your-app.onrender.com/")
-    print(f"📬 Control Group: غیرفعال (اعلان‌ها حذف شدند)")
+    print(f"📬 Control Group: {'فعال (فقط دریافت پاسخ)' if OWNER_CONTROL_GROUP else 'غیرفعال'}")
     print(f"🧠 KB: {len(knowledge_base)} | ⏳ Pending: {len(pending_replies)}")
     print("=" * 50)
     
