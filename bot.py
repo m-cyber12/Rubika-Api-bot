@@ -24,11 +24,13 @@ BOT_PERSONA = f"""
 با لحن صمیمی و دوستانه و به فارسی جواب بده.
 جواب‌ها کوتاه و طبیعی باشن.
 
-قوانین:
+قوانین بسیار مهم:
 - اگه کسی اسم "{OWNER_NAME}" رو برد، منظورش صاحب اکانت ({OWNER_NAME}) هست.
 - اگه سوالی درباره {OWNER_NAME} پرسیده شد و بلد بودی، مستقیم جواب بده.
-- اگه نمی‌دونی، حتماً بگو: "از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
+- اگه نمی‌دونی، حتماً و فقط بگو: "از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
 - هرگز حدس نزن.
+- اگر اطلاعاتی در مورد {OWNER_NAME} نداری، دقیقاً همین جمله رو بگو: "از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
+- از کلمات "نمی‌دونم"، "نمی‌دانم"، "اطلاع ندارم" یا هر عبارت مشابه دیگری استفاده نکن. فقط و فقط از عبارت "از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳" استفاده کن.
 """
 
 model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
@@ -139,7 +141,6 @@ def send_msg_sync(guid, text, reply_to=None):
     if main_loop is None:
         return False, "Bot not ready yet"
     
-    # تبدیل reply_to به عدد اگر رشته بود
     if reply_to is not None:
         try:
             reply_to = int(reply_to)
@@ -481,11 +482,9 @@ def api_answer():
     original = pending_replies.pop(pid)
     save_pending()
     
-    # ذخیره در دانش
     knowledge_base[original["user_text"]] = text
     save_kb()
 
-    # ====== تولید پاسخ توسط AI ======
     try:
         chat = model.start_chat(history=[])
         prompt = f"""
@@ -500,7 +499,6 @@ def api_answer():
         final_answer = text
         print(f"[AI ERROR in answer] {e}")
 
-    # ارسال پاسخ نهایی به کاربر با ریپلای
     reply_to_id = original.get("message_id")
     ok, result = send_msg_sync(original["chat_guid"], final_answer, reply_to=reply_to_id)
     if ok:
@@ -514,7 +512,7 @@ def api_answer():
 def api_logs():
     return jsonify({"logs": chat_logs})
 
-# ==================== قسمت ۲: ربات روبیکا ====================
+    # ==================== ربات روبیکا ====================
 def get_chat_session(chat_guid):
     if chat_guid not in chat_histories:
         chat_histories[chat_guid] = model.start_chat(history=[])
@@ -531,7 +529,6 @@ async def handle_messages(update: Updates):
     author_guid = getattr(update, "author_guid", "") or ""
     raw_msg_id = getattr(update, "message_id", None)
     
-    # ذخیره message_id به‌صورت عدد (یا None)
     try:
         message_id = int(raw_msg_id) if raw_msg_id is not None else None
     except (ValueError, TypeError):
@@ -540,7 +537,6 @@ async def handle_messages(update: Updates):
     if not user_text:
         return
 
-    # لاگ
     chat_logs.append({
         "time": datetime.now().strftime("%H:%M:%S"),
         "date": datetime.now().strftime("%Y-%m-%d"),
@@ -552,17 +548,15 @@ async def handle_messages(update: Updates):
         chat_logs.pop(0)
     save_logs()
 
-    # ===== بخش گروه کنترل (فقط برای دریافت پاسخ‌های شما) =====
+    # ===== گروه کنترل =====
     if OWNER_CONTROL_GROUP and chat_guid == OWNER_CONTROL_GROUP:
         reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
         reply_str = str(reply_to) if reply_to is not None else None
         if reply_str and reply_str in pending_replies:
             original = pending_replies.pop(reply_str)
             save_pending()
-            # ذخیره در دانش
             knowledge_base[original["user_text"]] = user_text
             save_kb()
-            # ====== تولید پاسخ توسط AI ======
             try:
                 chat = model.start_chat(history=[])
                 prompt = f"""
@@ -576,7 +570,6 @@ async def handle_messages(update: Updates):
             except Exception as e:
                 final_answer = user_text
                 print(f"[AI ERROR in control] {e}")
-            # ارسال به کاربر با ریپلای
             try:
                 await client.send_message(
                     original["chat_guid"], 
@@ -589,9 +582,9 @@ async def handle_messages(update: Updates):
                 pending_replies[reply_str] = original
                 save_pending()
                 await update.reply(f"❌ خطا در ارسال: {e}")
-            return  # دیگر ادامه نمی‌دهیم
+            return
 
-    # ۲. فیلتر پیام عادی (غیر از گروه کنترل)
+    # ===== فیلتر پیام =====
     is_private = chat_guid.startswith("u0")
     if is_private:
         if author_guid and author_guid != chat_guid:
@@ -600,15 +593,16 @@ async def handle_messages(update: Updates):
         reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
         reply_str = str(reply_to) if reply_to is not None else None
         is_reply_to_bot = reply_str is not None and reply_str in bot_sent_message_ids
-        if TRIGGER_WORD not in user_text and not is_reply_to_bot:
+        if not is_reply_to_bot and TRIGGER_WORD not in user_text:
             return
-        user_text = user_text.replace(TRIGGER_WORD, "", 1).strip()
+        if TRIGGER_WORD in user_text:
+            user_text = user_text.replace(TRIGGER_WORD, "", 1).strip()
         if not user_text:
             user_text = "سلام"
 
-    print(f"[MSG] {chat_guid} (pv={is_private}): {user_text[:80]}")
+    print(f"[MSG] chat={chat_guid}, private={is_private}, text={user_text[:80]}")
 
-    # ۳. بررسی Knowledge Base
+    # ===== دانش =====
     if user_text in knowledge_base:
         try:
             await asyncio.sleep(random.uniform(1, 3))
@@ -617,12 +611,12 @@ async def handle_messages(update: Updates):
             if sid is not None:
                 bot_sent_message_ids.add(str(sid))
                 save_bot_sent()
-            print("[KB] Replied from knowledge")
+            print(f"[KB] پاسخ از دانش برای: {user_text}")
         except Exception as e:
             print(f"[KB ERROR] {e}")
         return
 
-    # ۴. AI
+    # ===== AI =====
     try:
         await asyncio.sleep(random.uniform(3, 6))
         chat = get_chat_session(chat_guid)
@@ -635,35 +629,38 @@ async def handle_messages(update: Updates):
         
         response = await chat.send_message_async(user_text + kb_ctx)
         ai_text = response.text
+        print(f"[AI] پاسخ: {ai_text[:150]}")
 
-        waiting = any(p in ai_text for p in ["می‌پرسم", "ازش می‌پرسم", "بپرسم", "نمی‌دونم", "نمی‌دانم", "نمی دونم", "اطلاع ندارم"])
-        print(f"[AI] waiting={waiting} | {ai_text[:100]}")
+        # تشخیص دقیق‌تر بر اساس جمله‌ی مشخص
+        waiting = "از حسن می‌پرسم" in ai_text or "از حسن می‌پرسم و بهت می‌گم" in ai_text
+        
+        # اگر هر کلمه‌ی دیگری از "نمی‌دونم" استفاده کرد، باز هم waiting در نظر بگیر
+        if not waiting:
+            waiting = any(p in ai_text for p in ["نمی‌دونم", "نمی‌دانم", "نمی دونم", "اطلاع ندارم"])
+        
+        print(f"[AI] waiting={waiting}")
 
         if waiting:
-            # ثبت توی pending با message_id عددی
             pending_id = str(random.randint(100000, 999999))
             pending_item = {
                 "chat_guid": chat_guid,
                 "user_text": user_text,
                 "author_guid": author_guid,
-                "message_id": message_id,  # حالا عدد است یا None
+                "message_id": message_id,
                 "time": datetime.now().strftime("%H:%M:%S")
             }
             pending_replies[pending_id] = pending_item
-            print(f"[PENDING] Adding id={pending_id}, msg_id={message_id}")
+            print(f"[PENDING] اضافه شد id={pending_id}, msg_id={message_id}, text={user_text}")
             save_pending()
-            print(f"[PENDING] Saved to file. Total pending: {len(pending_replies)}")
+            print(f"[PENDING] مجموع pending: {len(pending_replies)}")
 
-            # ===== حذف شد: ارسال اعلان به گروه کنترل =====
-
-            # پیام "منتظر" به کاربر
             try:
                 sent = await update.reply(ai_text)
                 sid = getattr(sent, "message_id", None)
                 if sid is not None:
                     bot_sent_message_ids.add(str(sid))
                     save_bot_sent()
-                print("[REPLY] Wait message sent to user")
+                print("[REPLY] پیام منتظر ارسال شد")
             except Exception as e:
                 print(f"[REPLY ERROR] {e}")
         else:
@@ -675,7 +672,7 @@ async def handle_messages(update: Updates):
                 if len(bot_sent_message_ids) > 500:
                     bot_sent_message_ids.pop()
                     save_bot_sent()
-            print("[AI] Direct reply sent")
+            print("[AI] پاسخ مستقیم ارسال شد")
 
         if len(chat.history) > MAX_TURNS * 2:
             chat_histories[chat_guid] = model.start_chat(history=chat.history[-MAX_TURNS * 2:])
