@@ -28,7 +28,6 @@ BOT_PERSONA = f"""
 - اگه درباره {OWNER_NAME} نمی‌دونی، بگو: "از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
 - برای سوالات عمومی (غیر از {OWNER_NAME})، از دانش خودت استفاده کن و جواب بده.
 - اگه سوالی رو نمی‌دونی، بگو: "متاسفانه الان جوابش رو نمی‌دونم."
-- هرگز نگو که به اینترنت دسترسی نداری، مگر اینکه کاربر دقیقاً بپرسد: "آیا به اینترنت دسترسی داری؟" که در آن صورت بگو: "نه، مستقیم به اینترنت دسترسی ندارم ولی اطلاعات عمومی زیادی دارم."
 """
 
 model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
@@ -72,32 +71,24 @@ def load_all():
     global knowledge_base, pending_replies, chat_logs, bot_sent_message_ids
     knowledge_base = load_json(KB_FILE, {})
     pending_raw = load_json(PENDING_FILE, {})
-    pending_replies = {}
-    for k, v in pending_raw.items():
-        pending_replies[str(k)] = v
+    pending_replies = {str(k): v for k, v in pending_raw.items()}
     bot_sent_ids_raw = load_json(BOT_SENT_FILE, [])
     bot_sent_message_ids = set(str(x) for x in bot_sent_ids_raw)
     chat_logs = load_json(LOG_FILE, [])
-    print(f"[STARTUP] KB={len(knowledge_base)}, Pending={len(pending_replies)}, Logs={len(chat_logs)}, SentIDs={len(bot_sent_message_ids)}")
+    print(f"[STARTUP] KB={len(knowledge_base)}, Pending={len(pending_replies)}, Logs={len(chat_logs)}")
 
 def save_kb():
-    if save_json(KB_FILE, knowledge_base):
-        print(f"[SAVE] KB saved: {len(knowledge_base)} items")
+    save_json(KB_FILE, knowledge_base)
 
 def save_pending():
-    ok = save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()})
-    if ok:
-        print(f"[SAVE] Pending saved: {len(pending_replies)} items")
+    save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()})
 
 def save_bot_sent():
-    ok = save_json(BOT_SENT_FILE, list(bot_sent_message_ids))
-    if ok:
-        print(f"[SAVE] Bot sent IDs saved: {len(bot_sent_message_ids)} items")
+    save_json(BOT_SENT_FILE, list(bot_sent_message_ids))
 
 def save_logs():
     save_json(LOG_FILE, chat_logs)
 
-# Session restore
 SESSION_FILE = "my_rubika_account.rp"
 part1 = os.environ.get("SESSION_B64_PART1", "")
 part2 = os.environ.get("SESSION_B64_PART2", "")
@@ -112,9 +103,9 @@ if session_b64 and not os.path.exists(SESSION_FILE):
     try:
         with open(SESSION_FILE, "wb") as f:
             f.write(base64.b64decode(session_b64))
-        print(f"[SESSION] Restored {SESSION_FILE}")
+        print("[SESSION] Restored")
     except Exception as e:
-        print(f"[SESSION] Restore error: {e}")
+        print(f"[SESSION] Error: {e}")
 
 client = Client(name="my_rubika_account")
 
@@ -122,35 +113,28 @@ def send_msg_sync(guid, text, reply_to=None):
     if not guid or not text:
         return False, "Empty"
     if main_loop is None:
-        return False, "Bot not ready"
+        return False, "Not ready"
     if reply_to is not None:
         try:
             reply_to = int(reply_to)
-        except (ValueError, TypeError):
+        except:
             reply_to = None
     async def _send():
         try:
             if reply_to:
                 result = await client.send_message(guid, text, reply_to_message_id=reply_to)
-                print(f"[SEND] با ریپلای {reply_to}")
             else:
                 result = await client.send_message(guid, text)
-                print(f"[SEND] بدون ریپلای")
             return True, result
         except Exception as e:
-            print(f"[SEND FAIL] {e}")
-            try:
-                result = await client.send_message(guid, text)
-                return True, result
-            except Exception as e2:
-                return False, str(e2)
+            print(f"[SEND ERROR] {e}")
+            return False, str(e)
     try:
         future = asyncio.run_coroutine_threadsafe(_send(), main_loop)
         return future.result(timeout=15)
     except Exception as e:
         return False, str(e)
 
-# ==================== Flask App ====================
 app = Flask(__name__)
 
 DASHBOARD_HTML = """
@@ -162,7 +146,7 @@ DASHBOARD_HTML = """
 <title>دستیار روبیکا</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Tahoma,'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;padding:12px}
+body{font-family:Tahoma,sans-serif;background:#0d1117;color:#c9d1d9;padding:12px}
 .container{max-width:900px;margin:0 auto}
 h1{color:#58a6ff;text-align:center;margin-bottom:12px;font-size:20px}
 .stats{display:flex;gap:10px;margin-bottom:12px;justify-content:center;flex-wrap:wrap}
@@ -218,14 +202,13 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
   </div>
 </div>
 <div id="panel-send" class="panel">
-  <input type="text" id="s-guid" placeholder="GUID چت (مثلاً u0...)">
-  <textarea id="s-text" placeholder="متن پیام..."></textarea>
+  <input type="text" id="s-guid" placeholder="GUID چت">
+  <textarea id="s-text" placeholder="متن پیام"></textarea>
   <button type="button" id="btn-send-msg">📤 ارسال</button>
-  <p class="small">GUID رو از تب لاگ پیدا کن</p>
 </div>
 <div id="panel-kb" class="panel">
-  <input type="text" id="k-q" placeholder="سوال (مثلاً: شغل حسن چیه؟)">
-  <textarea id="k-a" placeholder="جواب..."></textarea>
+  <input type="text" id="k-q" placeholder="سوال">
+  <textarea id="k-a" placeholder="جواب"></textarea>
   <button type="button" id="btn-add-kb">➕ ذخیره</button>
   <hr>
   <div id="kb-list"></div>
@@ -234,11 +217,10 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
   <div id="pending-list"></div>
 </div>
 <div id="panel-logs" class="panel">
-  <div id="logs-list" style="max-height:400px;overflow-y:auto"></div>
+  <div id="logs-list"></div>
 </div>
 </div>
 <script>
-console.log('JS loaded');
 function esc(t){const d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
 function switchTab(name){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
@@ -249,28 +231,22 @@ function switchTab(name){
   if(name==='pending') loadPending();
   if(name==='logs') loadLogs();
 }
-document.querySelectorAll('.tab').forEach(function(btn){
-  btn.addEventListener('click', function(){ switchTab(this.getAttribute('data-tab')); });
-});
-function addChat(role,text){
-  const b=document.getElementById('chat-box');
-  const d=document.createElement('div');
-  d.className='msg msg-'+role;
-  d.innerHTML=(role==='u'?'👤 <b>تو:</b> ':'🤖 <b>AI:</b> ')+esc(text);
-  b.appendChild(d); b.scrollTop=b.scrollHeight;
-}
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 async function sendChat(){
   const inp=document.getElementById('chat-in');
   const t=inp.value.trim(); if(!t) return;
-  inp.value=''; addChat('u',t);
+  inp.value='';
+  const box=document.getElementById('chat-box');
+  box.innerHTML+='<div class="msg msg-u">👤 <b>تو:</b> '+esc(t)+'</div>';
   try{
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:t})});
     const d=await r.json();
-    addChat('a',d.reply||d.error||'خطا');
-  }catch(e){addChat('a','❌ خطای شبکه');}
+    box.innerHTML+='<div class="msg msg-a">🤖 <b>AI:</b> '+esc(d.reply||d.error||'خطا')+'</div>';
+    box.scrollTop=box.scrollHeight;
+  }catch(e){}
 }
-document.getElementById('btn-chat-send').addEventListener('click', sendChat);
-document.getElementById('chat-in').addEventListener('keydown', function(e){if(e.key==='Enter') sendChat();});
+document.getElementById('btn-chat-send').onclick=sendChat;
+document.getElementById('chat-in').onkeydown=e=>{if(e.key==='Enter')sendChat();};
 async function sendMsg(){
   const g=document.getElementById('s-guid').value.trim();
   const t=document.getElementById('s-text').value.trim();
@@ -278,92 +254,92 @@ async function sendMsg(){
   try{
     const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guid:g,text:t})});
     const d=await r.json();
-    alert(d.ok?'✅ ارسال شد!':'❌ '+(d.error||'خطا'));
-  }catch(e){alert('❌ خطای شبکه');}
+    alert(d.ok?'✅ ارسال شد':'❌ خطا');
+  }catch(e){alert('❌ خطا');}
 }
-document.getElementById('btn-send-msg').addEventListener('click', sendMsg);
+document.getElementById('btn-send-msg').onclick=sendMsg;
 async function addKB(){
   const q=document.getElementById('k-q').value.trim();
   const a=document.getElementById('k-a').value.trim();
   if(!q||!a) return alert('سوال و جواب رو پر کن!');
-  try{
-    await fetch('/api/kb',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q,a})});
-    document.getElementById('k-q').value='';
-    document.getElementById('k-a').value='';
-    loadKB(); updateStats();
-  }catch(e){alert('❌ خطا');}
+  await fetch('/api/kb',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q,a})});
+  document.getElementById('k-q').value='';
+  document.getElementById('k-a').value='';
+  loadKB(); updateStats();
 }
+document.getElementById('btn-add-kb').onclick=addKB;
 async function delKB(q){
   if(!confirm('حذف شود؟')) return;
-  try{
-    await fetch('/api/kb?q='+encodeURIComponent(q),{method:'DELETE'});
-    loadKB(); updateStats();
-  }catch(e){alert('❌ خطا');}
+  await fetch('/api/kb?q='+encodeURIComponent(q),{method:'DELETE'});
+  loadKB(); updateStats();
 }
 async function loadKB(){
   const list=document.getElementById('kb-list');
   try{
-    const r=await fetch('/api/kb'); const d=await r.json();
-    const items=d.kb||{}; list.innerHTML='';
+    const r=await fetch('/api/kb');
+    const items=(await r.json()).kb||{};
+    list.innerHTML='';
     if(Object.keys(items).length===0){list.innerHTML='<div class="empty">دانشی ذخیره نشده</div>';return;}
     for(const [q,a] of Object.entries(items)){
       const div=document.createElement('div'); div.className='kb-item';
       div.innerHTML='<div><b>س:</b> '+esc(q)+'<br><b>ج:</b> '+esc(a)+'</div>';
       const btn=document.createElement('button'); btn.className='btn-red'; btn.textContent='🗑';
-      btn.addEventListener('click', function(){delKB(q);});
+      btn.onclick=()=>delKB(q);
       div.appendChild(btn); list.appendChild(div);
     }
-  }catch(e){list.innerHTML='<div class="empty">❌ خطا در بارگذاری</div>';}
+  }catch(e){}
 }
-document.getElementById('btn-add-kb').addEventListener('click', addKB);
 async function ansPen(id,text){
   text=text.trim(); if(!text) return;
   try{
     const r=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:parseInt(id),text:text})});
     const d=await r.json();
     if(d.ok){loadPending();updateStats();}else alert(d.error||'خطا');
-  }catch(e){alert('❌ خطا');}
+  }catch(e){}
 }
 async function loadPending(){
   const list=document.getElementById('pending-list');
   try{
-    const r=await fetch('/api/pending'); const d=await r.json();
-    const items=d.pending||{}; list.innerHTML='';
+    const r=await fetch('/api/pending');
+    const items=(await r.json()).pending||{};
+    list.innerHTML='';
     const entries=Object.entries(items);
     if(entries.length===0){list.innerHTML='<div class="empty">سوالی در انتظار نیست</div>';return;}
     for(const [id,info] of entries){
-      const item=document.createElement('div'); item.className='pending-item';
-      item.innerHTML='<div><b>#'+id+'</b> <span class="small">'+esc(info.chat_guid)+'</span><br>'+esc(info.user_text)+'</div>';
-      list.appendChild(item);
+      const div=document.createElement('div'); div.className='pending-item';
+      div.innerHTML='<div><b>#'+id+'</b> <span class="small">'+esc(info.chat_guid)+'</span><br>'+esc(info.user_text)+'</div>';
+      list.appendChild(div);
       const row=document.createElement('div'); row.className='pending-row';
       const inp=document.createElement('input'); inp.type='text'; inp.placeholder='جوابت رو بنویس...';
-      inp.addEventListener('keydown', function(e){if(e.key==='Enter') ansPen(id,inp.value);});
+      inp.onkeydown=e=>{if(e.key==='Enter') ansPen(id,inp.value);};
       const btn=document.createElement('button'); btn.textContent='✅';
-      btn.addEventListener('click', function(){ansPen(id,inp.value);});
+      btn.onclick=()=>ansPen(id,inp.value);
       row.appendChild(inp); row.appendChild(btn); list.appendChild(row);
     }
-  }catch(e){list.innerHTML='<div class="empty">❌ خطا در بارگذاری</div>';}
+  }catch(e){}
 }
 async function loadLogs(){
   const list=document.getElementById('logs-list');
   try{
-    const r=await fetch('/api/logs'); const d=await r.json();
-    const logs=(d.logs||[]).slice().reverse(); list.innerHTML='';
+    const r=await fetch('/api/logs');
+    const logs=(await r.json()).logs||[];
+    list.innerHTML='';
     if(logs.length===0){list.innerHTML='<div class="empty">لاگ خالیه</div>';return;}
-    for(const log of logs){
+    for(const log of logs.reverse()){
       const div=document.createElement('div'); div.className='msg msg-u';
       div.innerHTML='<span class="small">'+esc(log.time)+' | '+esc(log.guid)+'</span><br><b>'+esc(log.from)+':</b> '+esc(log.text);
       list.appendChild(div);
     }
-  }catch(e){list.innerHTML='<div class="empty">❌ خطا در بارگذاری</div>';}
+  }catch(e){}
 }
 async function updateStats(){
   try{
-    const r=await fetch('/api/stats'); const d=await r.json();
+    const r=await fetch('/api/stats');
+    const d=await r.json();
     document.getElementById('st-kb').textContent=d.kb;
     document.getElementById('st-pen').textContent=d.pen;
     document.getElementById('st-log').textContent=d.today;
-  }catch(e){console.log('stats error',e);}
+  }catch(e){}
 }
 updateStats();
 setInterval(updateStats,5000);
@@ -401,9 +377,7 @@ def api_send():
     guid = data.get("guid", "").strip()
     text = data.get("text", "").strip()
     ok, result = send_msg_sync(guid, text)
-    if ok:
-        return jsonify({"ok": True})
-    return jsonify({"error": result}), 500
+    return jsonify({"ok": ok, "error": result if not ok else None})
 
 @app.route("/api/kb", methods=["GET", "POST", "DELETE"])
 def api_kb():
@@ -445,17 +419,10 @@ def api_answer():
     save_kb()
     try:
         chat = model.start_chat(history=[])
-        prompt = f"""
-        کاربر این سوال را پرسیده بود: "{original['user_text']}"
-        من (صاحب ربات) این پاسخ را به تو می‌دهم: "{text}"
-        حالا تو به‌عنوان دستیار، این پاسخ را با لحن خودت و به‌صورت کامل و دوستانه به کاربر بگو.
-        پاسخ را فقط به فارسی و کوتاه اما کامل بگو.
-        """
-        response = chat.send_message(prompt)
-        final_answer = response.text
-    except Exception as e:
+        prompt = f"کاربر پرسید: '{original['user_text']}'، پاسخ من: '{text}'، حالا با لحن خودت بگو."
+        final_answer = chat.send_message(prompt).text
+    except:
         final_answer = text
-        print(f"[AI ERROR in answer] {e}")
     ok, result = send_msg_sync(original["chat_guid"], final_answer, reply_to=original.get("message_id"))
     if ok:
         return jsonify({"ok": True})
@@ -468,8 +435,7 @@ def api_answer():
 def api_logs():
     return jsonify({"logs": chat_logs})
 
-    # ==================== ربات روبیکا ====================
-def get_chat_session(chat_guid):
+    def get_chat_session(chat_guid):
     if chat_guid not in chat_histories:
         chat_histories[chat_guid] = model.start_chat(history=[])
     return chat_histories[chat_guid]
@@ -487,7 +453,7 @@ async def handle_messages(update: Updates):
     
     try:
         message_id = int(raw_msg_id) if raw_msg_id is not None else None
-    except (ValueError, TypeError):
+    except:
         message_id = None
     
     if not user_text:
@@ -504,7 +470,7 @@ async def handle_messages(update: Updates):
         chat_logs.pop(0)
     save_logs()
 
-    # ===== گروه کنترل (با اعلان) =====
+    # گروه کنترل (فقط ریپلای)
     if OWNER_CONTROL_GROUP and chat_guid == OWNER_CONTROL_GROUP:
         reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
         reply_str = str(reply_to) if reply_to is not None else None
@@ -515,31 +481,24 @@ async def handle_messages(update: Updates):
             save_kb()
             try:
                 chat = model.start_chat(history=[])
-                prompt = f"""
-                کاربر این سوال را پرسیده بود: "{original['user_text']}"
-                من (صاحب ربات) این پاسخ را به تو می‌دهم: "{user_text}"
-                حالا تو به‌عنوان دستیار، این پاسخ را با لحن خودت و به‌صورت کامل و دوستانه به کاربر بگو.
-                پاسخ را فقط به فارسی و کوتاه اما کامل بگو.
-                """
-                response = chat.send_message(prompt)
-                final_answer = response.text
-            except Exception as e:
+                prompt = f"کاربر پرسید: '{original['user_text']}'، پاسخ من: '{user_text}'، حالا با لحن خودت بگو."
+                final_answer = chat.send_message(prompt).text
+            except:
                 final_answer = user_text
-                print(f"[AI ERROR in control] {e}")
             try:
                 await client.send_message(
-                    original["chat_guid"], 
-                    final_answer, 
+                    original["chat_guid"],
+                    final_answer,
                     reply_to_message_id=original.get("message_id")
                 )
-                await update.reply("✅ پاسخ با موفقیت ارسال شد!")
+                await update.reply("✅ پاسخ ارسال شد!")
             except Exception as e:
                 pending_replies[reply_str] = original
                 save_pending()
-                await update.reply(f"❌ خطا در ارسال: {e}")
+                await update.reply(f"❌ خطا: {e}")
             return
 
-    # ===== فیلتر پیام =====
+    # فیلتر پیام
     is_private = chat_guid.startswith("u0")
     if is_private:
         if author_guid and author_guid != chat_guid:
@@ -558,11 +517,11 @@ async def handle_messages(update: Updates):
                 user_text = "سلام"
             if not is_reply_to_bot:
                 chat_histories[chat_guid] = model.start_chat(history=[])
-                print(f"[NEW SESSION] تاریخچه ریست شد برای {chat_guid}")
+                print(f"[NEW] تاریخچه ریست شد")
 
-    print(f"[MSG] chat={chat_guid}, private={is_private}, reply_to_bot={is_reply_to_bot}, text={user_text[:80]}")
+    print(f"[MSG] {chat_guid} | {user_text[:50]}")
 
-    # ===== دانش =====
+    # دانش
     if user_text in knowledge_base:
         try:
             await asyncio.sleep(random.uniform(1, 3))
@@ -571,59 +530,54 @@ async def handle_messages(update: Updates):
             if sid is not None:
                 bot_sent_message_ids.add(str(sid))
                 save_bot_sent()
-            print(f"[KB] پاسخ از دانش برای: {user_text}")
+            print("[KB] پاسخ از دانش")
         except Exception as e:
             print(f"[KB ERROR] {e}")
         return
 
-    # ===== AI =====
+    # AI
     try:
         await asyncio.sleep(random.uniform(3, 6))
         chat = get_chat_session(chat_guid)
         
         kb_ctx = ""
         if knowledge_base:
-            kb_ctx = "\nاطلاعات شناخته شده:\n"
-            for q, a in list(knowledge_base.items())[-5:]:
-                kb_ctx += f"- {q}: {a}\n"
+            kb_ctx = "\nاطلاعات:\n" + "\n".join([f"- {q}: {a}" for q, a in list(knowledge_base.items())[-5:]])
         
         response = await chat.send_message_async(user_text + kb_ctx)
         ai_text = response.text
-        print(f"[AI] پاسخ: {ai_text[:150]}")
+        print(f"[AI] {ai_text[:100]}")
 
-        # تشخیص waiting
         waiting = False
-        clean_text = ai_text.replace("😊", "").replace("❤️", "").replace("✨", "").strip()
-        if "از حسن می‌پرسم" in clean_text or "از حسن می‌پرسم و بهت می‌گم" in clean_text:
+        clean = ai_text.replace("😊", "").replace("❤️", "").strip()
+        if "از حسن می‌پرسم" in clean:
             waiting = True
         else:
-            waiting_keywords = ["نمی‌دونم", "نمی‌دانم", "نمی دونم", "اطلاع ندارم", "می‌پرسم", "ازش می‌پرسم", "بپرسم"]
-            waiting = any(kw in ai_text for kw in waiting_keywords)
+            keywords = ["نمی‌دونم", "نمی‌دانم", "اطلاع ندارم", "می‌پرسم"]
+            waiting = any(k in ai_text for k in keywords)
         print(f"[AI] waiting={waiting}")
 
         if waiting:
             pending_id = str(random.randint(100000, 999999))
-            pending_item = {
+            pending_replies[pending_id] = {
                 "chat_guid": chat_guid,
                 "user_text": user_text,
                 "author_guid": author_guid,
                 "message_id": message_id,
                 "time": datetime.now().strftime("%H:%M:%S")
             }
-            pending_replies[pending_id] = pending_item
-            print(f"[PENDING] اضافه شد id={pending_id}, msg_id={message_id}")
             save_pending()
+            print(f"[PENDING] {pending_id} | {user_text}")
 
-            # ارسال اعلان به گروه کنترل (برای فعال‌سازی ریپلای)
             if OWNER_CONTROL_GROUP:
                 try:
-                    notif = f"❓ سوال جدید: {user_text}\n🆔 چت: {chat_guid}\n⬅️ ریپلای کن تا جواب بدی"
-                    sent_notif = await client.send_message(OWNER_CONTROL_GROUP, notif)
-                    nid = getattr(sent_notif, "message_id", None)
+                    notif = f"❓ سوال: {user_text}\n🆔 {chat_guid}\n⬅️ ریپلای کن"
+                    sent = await client.send_message(OWNER_CONTROL_GROUP, notif)
+                    nid = getattr(sent, "message_id", None)
                     if nid is not None:
                         pending_replies[str(nid)] = pending_replies.pop(pending_id)
                         save_pending()
-                        print(f"[NOTIF] اعلان ارسال شد، nid={nid}")
+                        print(f"[NOTIF] ارسال شد nid={nid}")
                 except Exception as e:
                     print(f"[NOTIF ERROR] {e}")
 
@@ -633,7 +587,6 @@ async def handle_messages(update: Updates):
                 if sid is not None:
                     bot_sent_message_ids.add(str(sid))
                     save_bot_sent()
-                print("[REPLY] پیام منتظر ارسال شد")
             except Exception as e:
                 print(f"[REPLY ERROR] {e}")
         else:
@@ -642,10 +595,7 @@ async def handle_messages(update: Updates):
             if sid is not None:
                 bot_sent_message_ids.add(str(sid))
                 save_bot_sent()
-                if len(bot_sent_message_ids) > 500:
-                    bot_sent_message_ids.pop()
-                    save_bot_sent()
-            print("[AI] پاسخ مستقیم ارسال شد")
+            print("[AI] پاسخ مستقیم")
 
         if len(chat.history) > MAX_TURNS * 2:
             chat_histories[chat_guid] = model.start_chat(history=chat.history[-MAX_TURNS * 2:])
@@ -653,7 +603,6 @@ async def handle_messages(update: Updates):
     except Exception as e:
         print(f"[ERROR] {e}")
 
-# ==================== اجرا ====================
 if __name__ == "__main__":
     load_all()
     
@@ -664,15 +613,12 @@ if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     print("=" * 50)
     print("🚀 Bot + Dashboard running")
-    print(f"📊 URL: https://your-app.onrender.com/")
-    print(f"📬 Control Group: {'فعال (با اعلان)' if OWNER_CONTROL_GROUP else 'غیرفعال'}")
+    print(f"📬 Control Group: {OWNER_CONTROL_GROUP or 'غیرفعال'}")
     print(f"🧠 KB: {len(knowledge_base)} | ⏳ Pending: {len(pending_replies)}")
     print("=" * 50)
     
     RUBIKA_PHONE = os.environ.get("RUBIKA_PHONE") or os.environ.get("rubika_phone")
     if RUBIKA_PHONE:
-        print(f"📱 Using phone: {RUBIKA_PHONE[:6]}...")
         client.run(phone_number=RUBIKA_PHONE)
     else:
-        print("📱 No phone number set, trying session auth...")
         client.run()
