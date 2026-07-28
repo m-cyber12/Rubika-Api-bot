@@ -33,7 +33,11 @@ BOT_PERSONA = f"""
 - از کلمات "نمی‌دونم"، "نمی‌دانم"، "اطلاع ندارم" یا هر عبارت مشابه دیگری استفاده نکن. فقط و فقط از عبارت "از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳" استفاده کن.
 """
 
-model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
+model = genai.GenerativeModel(
+    model_name='gemini-1.5-flash',  # یا 'gemini-1.5-pro'
+    system_instruction=BOT_PERSONA,
+    tools=['google_search']  # <--- فعال‌سازی جستجو
+)
 
 # --- حافظه‌ها ---
 chat_histories = {}
