@@ -470,17 +470,40 @@ def api_answer():
     text = data.get("text", "").strip()
     if pid not in pending_replies:
         return jsonify({"error": "Not found"}), 404
+    
     original = pending_replies.pop(pid)
     save_pending()
+    
+    # ذخیره در دانش
     knowledge_base[original["user_text"]] = text
     save_kb()
-    ok, result = send_msg_sync(original["chat_guid"], text, reply_to=original.get("message_id"))
+
+    # ====== مرحله‌ی جدید: تولید پاسخ توسط AI ======
+    try:
+        chat = model.start_chat(history=[])
+        prompt = f"""
+        کاربر این سوال را پرسیده بود: "{original['user_text']}"
+        من (صاحب ربات) این پاسخ را به تو می‌دهم: "{text}"
+        حالا تو به‌عنوان دستیار، این پاسخ را با لحن خودت و به‌صورت کامل و دوستانه به کاربر بگو.
+        پاسخ را فقط به فارسی و کوتاه اما کامل بگو.
+        """
+        response = chat.send_message(prompt)
+        final_answer = response.text
+    except Exception as e:
+        # اگر AI خطا داد، همان جواب مستقیم رو بفرست
+        final_answer = text
+        print(f"[AI ERROR in answer] {e}")
+
+    # ارسال پاسخ نهایی به کاربر
+    ok, result = send_msg_sync(original["chat_guid"], final_answer, reply_to=original.get("message_id"))
     if ok:
         return jsonify({"ok": True})
-    pending_replies[pid] = original
-    save_pending()
-    return jsonify({"error": result}), 500
-
+    else:
+        # اگر ارسال ناموفق بود، دوباره به pending برگردان
+        pending_replies[pid] = original
+        save_pending()
+        return jsonify({"error": result}), 500
+        
 @app.route("/api/logs")
 def api_logs():
     return jsonify({"logs": chat_logs})
