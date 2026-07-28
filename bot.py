@@ -13,7 +13,6 @@ from flask import Flask, request, jsonify, render_template_string
 logging.basicConfig(level=logging.INFO)
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
-# ==================== تنظیمات ====================
 OWNER_NAME = "حسن"
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
 TRIGGER_WORD = "فرایدی"
@@ -34,7 +33,6 @@ BOT_PERSONA = f"""
 
 model = genai.GenerativeModel('gemini-flash-latest', system_instruction=BOT_PERSONA)
 
-# --- حافظه‌ها ---
 chat_histories = {}
 MAX_TURNS = 10
 bot_sent_message_ids = set()
@@ -51,7 +49,6 @@ chat_logs = []
 
 main_loop = None
 
-# --- Load/Save ---
 def load_json(path, default):
     if os.path.exists(path):
         try:
@@ -86,15 +83,11 @@ def load_all():
 def save_kb():
     if save_json(KB_FILE, knowledge_base):
         print(f"[SAVE] KB saved: {len(knowledge_base)} items")
-    else:
-        print(f"[SAVE FAIL] KB not saved!")
 
 def save_pending():
     ok = save_json(PENDING_FILE, {str(k): v for k, v in pending_replies.items()})
     if ok:
         print(f"[SAVE] Pending saved: {len(pending_replies)} items")
-    else:
-        print(f"[SAVE FAIL] Pending not saved!")
 
 def save_bot_sent():
     ok = save_json(BOT_SENT_FILE, list(bot_sent_message_ids))
@@ -104,73 +97,60 @@ def save_bot_sent():
 def save_logs():
     save_json(LOG_FILE, chat_logs)
 
-# --- Restore Rubika session ---
+# Session restore
 SESSION_FILE = "my_rubika_account.rp"
-
 part1 = os.environ.get("SESSION_B64_PART1", "")
 part2 = os.environ.get("SESSION_B64_PART2", "")
 session_b64 = part1 + part2
-
 if not session_b64:
     part1 = os.environ.get("session_b64_part1", "")
     part2 = os.environ.get("session_b64_part2", "")
     session_b64 = part1 + part2
-    if session_b64:
-        print("[SESSION] Found lowercase session_b64_part1/part2")
 
 if session_b64 and not os.path.exists(SESSION_FILE):
     import base64
     try:
         with open(SESSION_FILE, "wb") as f:
             f.write(base64.b64decode(session_b64))
-        print(f"[SESSION] Restored {SESSION_FILE}: {os.path.getsize(SESSION_FILE)} bytes")
+        print(f"[SESSION] Restored {SESSION_FILE}")
     except Exception as e:
         print(f"[SESSION] Restore error: {e}")
-elif os.path.exists(SESSION_FILE):
-    print(f"[SESSION] File exists: {os.path.getsize(SESSION_FILE)} bytes")
-else:
-    print("[SESSION] No session env vars found!")
 
 client = Client(name="my_rubika_account")
 
-# ==================== HELPER ====================
 def send_msg_sync(guid, text, reply_to=None):
     if not guid or not text:
-        return False, "Empty guid or text"
+        return False, "Empty"
     if main_loop is None:
-        return False, "Bot not ready yet"
-    
+        return False, "Bot not ready"
     if reply_to is not None:
         try:
             reply_to = int(reply_to)
         except (ValueError, TypeError):
             reply_to = None
-            print(f"[WARN] reply_to is not a number: {reply_to}")
-    
     async def _send():
         try:
             if reply_to:
                 result = await client.send_message(guid, text, reply_to_message_id=reply_to)
-                print(f"[SEND] با ریپلای به message_id={reply_to}")
+                print(f"[SEND] با ریپلای {reply_to}")
             else:
                 result = await client.send_message(guid, text)
                 print(f"[SEND] بدون ریپلای")
             return True, result
         except Exception as e:
-            print(f"[SEND FAIL] {guid}: {e}")
+            print(f"[SEND FAIL] {e}")
             try:
                 result = await client.send_message(guid, text)
                 return True, result
             except Exception as e2:
                 return False, str(e2)
-    
     try:
         future = asyncio.run_coroutine_threadsafe(_send(), main_loop)
         return future.result(timeout=15)
     except Exception as e:
         return False, str(e)
 
-# ==================== FLASK APP ====================
+# ==================== Flask App ====================
 app = Flask(__name__)
 
 DASHBOARD_HTML = """
@@ -230,7 +210,6 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
   <button type="button" class="tab" data-tab="pending">⏳ سوالات</button>
   <button type="button" class="tab" data-tab="logs">📋 لاگ</button>
 </div>
-
 <div id="panel-chat" class="panel active">
   <div class="msg-box" id="chat-box"></div>
   <div style="display:flex;gap:8px">
@@ -238,14 +217,12 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
     <button type="button" id="btn-chat-send">ارسال</button>
   </div>
 </div>
-
 <div id="panel-send" class="panel">
   <input type="text" id="s-guid" placeholder="GUID چت (مثلاً u0...)">
   <textarea id="s-text" placeholder="متن پیام..."></textarea>
   <button type="button" id="btn-send-msg">📤 ارسال</button>
   <p class="small">GUID رو از تب لاگ پیدا کن</p>
 </div>
-
 <div id="panel-kb" class="panel">
   <input type="text" id="k-q" placeholder="سوال (مثلاً: شغل حسن چیه؟)">
   <textarea id="k-a" placeholder="جواب..."></textarea>
@@ -253,21 +230,16 @@ hr{border:0;border-top:1px solid #30363d;margin:10px 0}
   <hr>
   <div id="kb-list"></div>
 </div>
-
 <div id="panel-pending" class="panel">
   <div id="pending-list"></div>
 </div>
-
 <div id="panel-logs" class="panel">
   <div id="logs-list" style="max-height:400px;overflow-y:auto"></div>
 </div>
 </div>
-
 <script>
-console.log('JS loaded - v5');
-
+console.log('JS loaded');
 function esc(t){const d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
-
 function switchTab(name){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -277,11 +249,9 @@ function switchTab(name){
   if(name==='pending') loadPending();
   if(name==='logs') loadLogs();
 }
-
 document.querySelectorAll('.tab').forEach(function(btn){
   btn.addEventListener('click', function(){ switchTab(this.getAttribute('data-tab')); });
 });
-
 function addChat(role,text){
   const b=document.getElementById('chat-box');
   const d=document.createElement('div');
@@ -289,7 +259,6 @@ function addChat(role,text){
   d.innerHTML=(role==='u'?'👤 <b>تو:</b> ':'🤖 <b>AI:</b> ')+esc(text);
   b.appendChild(d); b.scrollTop=b.scrollHeight;
 }
-
 async function sendChat(){
   const inp=document.getElementById('chat-in');
   const t=inp.value.trim(); if(!t) return;
@@ -300,10 +269,8 @@ async function sendChat(){
     addChat('a',d.reply||d.error||'خطا');
   }catch(e){addChat('a','❌ خطای شبکه');}
 }
-
 document.getElementById('btn-chat-send').addEventListener('click', sendChat);
 document.getElementById('chat-in').addEventListener('keydown', function(e){if(e.key==='Enter') sendChat();});
-
 async function sendMsg(){
   const g=document.getElementById('s-guid').value.trim();
   const t=document.getElementById('s-text').value.trim();
@@ -315,7 +282,6 @@ async function sendMsg(){
   }catch(e){alert('❌ خطای شبکه');}
 }
 document.getElementById('btn-send-msg').addEventListener('click', sendMsg);
-
 async function addKB(){
   const q=document.getElementById('k-q').value.trim();
   const a=document.getElementById('k-a').value.trim();
@@ -350,7 +316,6 @@ async function loadKB(){
   }catch(e){list.innerHTML='<div class="empty">❌ خطا در بارگذاری</div>';}
 }
 document.getElementById('btn-add-kb').addEventListener('click', addKB);
-
 async function ansPen(id,text){
   text=text.trim(); if(!text) return;
   try{
@@ -379,7 +344,6 @@ async function loadPending(){
     }
   }catch(e){list.innerHTML='<div class="empty">❌ خطا در بارگذاری</div>';}
 }
-
 async function loadLogs(){
   const list=document.getElementById('logs-list');
   try{
@@ -393,7 +357,6 @@ async function loadLogs(){
     }
   }catch(e){list.innerHTML='<div class="empty">❌ خطا در بارگذاری</div>';}
 }
-
 async function updateStats(){
   try{
     const r=await fetch('/api/stats'); const d=await r.json();
@@ -402,7 +365,6 @@ async function updateStats(){
     document.getElementById('st-log').textContent=d.today;
   }catch(e){console.log('stats error',e);}
 }
-
 updateStats();
 setInterval(updateStats,5000);
 </script>
@@ -477,13 +439,10 @@ def api_answer():
     text = data.get("text", "").strip()
     if pid not in pending_replies:
         return jsonify({"error": "Not found"}), 404
-    
     original = pending_replies.pop(pid)
     save_pending()
-    
     knowledge_base[original["user_text"]] = text
     save_kb()
-
     try:
         chat = model.start_chat(history=[])
         prompt = f"""
@@ -497,9 +456,7 @@ def api_answer():
     except Exception as e:
         final_answer = text
         print(f"[AI ERROR in answer] {e}")
-
-    reply_to_id = original.get("message_id")
-    ok, result = send_msg_sync(original["chat_guid"], final_answer, reply_to=reply_to_id)
+    ok, result = send_msg_sync(original["chat_guid"], final_answer, reply_to=original.get("message_id"))
     if ok:
         return jsonify({"ok": True})
     else:
@@ -547,73 +504,7 @@ async def handle_messages(update: Updates):
         chat_logs.pop(0)
     save_logs()
 
-    # ===== گروه کنترل =====
-    if OWNER_CONTROL_GROUP and chat_guid == OWNER_CONTROL_GROUP:
-        reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
-        reply_str = str(reply_to) if reply_to is not None else None
-        if reply_str and reply_str in pending_replies:
-            original = pending_replies.pop(reply_str)
-            save_pending()
-            knowledge_base[original["user_text"]] = user_text
-            save_kb()
-            try:
-                chat = model.start_chat(history=[])
-                prompt = f"""
-                کاربر این سوال را پرسیده بود: "{original['user_text']}"
-                من (صاحب ربات) این پاسخ را به تو می‌دهم: "{user_text}"
-                حالا تو به‌عنوان دستیار، این پاسخ را با لحن خودت و به‌صورت کامل و دوستانه به کاربر بگو.
-                پاسخ را فقط به فارسی و کوتاه اما کامل بگو.
-                """
-                response = chat.send_message(prompt)
-                final_answer = response.text
-            except Exception as e:
-                final_answer = user_text
-                print(f"[AI ERROR in control] {e}")
-            try:
-                await client.send_message(
-                    original["chat_guid"], 
-                    final_answer, 
-                    reply_to_message_id=original.get("message_id")
-                )
-                print(f"[CONTROL] پاسخ با ریپلای به message_id={original.get('message_id')} ارسال شد")
-                await update.reply("✅ پاسخ با موفقیت ارسال شد!")
-            except Exception as e:
-                pending_replies[reply_str] = original
-                save_pending()
-                await update.reply(f"❌ خطا در ارسال: {e}")
-            return
-
-@client.on_message_updates()
-async def handle_messages(update: Updates):
-    global main_loop
-    if main_loop is None:
-        main_loop = asyncio.get_running_loop()
-    
-    chat_guid = getattr(update, "object_guid", "") or ""
-    user_text = getattr(update, "text", None)
-    author_guid = getattr(update, "author_guid", "") or ""
-    raw_msg_id = getattr(update, "message_id", None)
-    
-    try:
-        message_id = int(raw_msg_id) if raw_msg_id is not None else None
-    except (ValueError, TypeError):
-        message_id = None
-    
-    if not user_text:
-        return
-
-    chat_logs.append({
-        "time": datetime.now().strftime("%H:%M:%S"),
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "guid": chat_guid,
-        "from": author_guid or "unknown",
-        "text": user_text[:200]
-    })
-    if len(chat_logs) > 1000:
-        chat_logs.pop(0)
-    save_logs()
-
-    # ===== گروه کنترل (فقط برای پاسخ‌های شما) =====
+    # ===== گروه کنترل (با اعلان) =====
     if OWNER_CONTROL_GROUP and chat_guid == OWNER_CONTROL_GROUP:
         reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
         reply_str = str(reply_to) if reply_to is not None else None
@@ -649,30 +540,25 @@ async def handle_messages(update: Updates):
             return
 
     # ===== فیلتر پیام =====
-is_private = chat_guid.startswith("u0")
-if is_private:
-    if author_guid and author_guid != chat_guid:
-        return
-else:
-    reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
-    reply_str = str(reply_to) if reply_to is not None else None
-    is_reply_to_bot = reply_str is not None and reply_str in bot_sent_message_ids
-    
-    # اگر ریپلای به ربات نیست و کلمه کلیدی هم نداره، نادیده بگیر
-    if not is_reply_to_bot and TRIGGER_WORD not in user_text:
-        return
-    
-    # اگر کلمه کلیدی داشت، از متن پاکش کن
-    if TRIGGER_WORD in user_text:
-        user_text = user_text.replace(TRIGGER_WORD, "", 1).strip()
-        if not user_text:
-            user_text = "سلام"
+    is_private = chat_guid.startswith("u0")
+    if is_private:
+        if author_guid and author_guid != chat_guid:
+            return
+    else:
+        reply_to = getattr(update, "reply_to_message_id", None) or getattr(update, "reply_message_id", None)
+        reply_str = str(reply_to) if reply_to is not None else None
+        is_reply_to_bot = reply_str is not None and reply_str in bot_sent_message_ids
         
-        # ===== اینجا: اگر ریپلای به ربات نبود، تاریخچه رو ریست کن =====
-        if not is_reply_to_bot:
-            # شروع یه بحث جدید
-            chat_histories[chat_guid] = model.start_chat(history=[])
-            print(f"[NEW SESSION] تاریخچه برای {chat_guid} ریست شد")
+        if not is_reply_to_bot and TRIGGER_WORD not in user_text:
+            return
+        
+        if TRIGGER_WORD in user_text:
+            user_text = user_text.replace(TRIGGER_WORD, "", 1).strip()
+            if not user_text:
+                user_text = "سلام"
+            if not is_reply_to_bot:
+                chat_histories[chat_guid] = model.start_chat(history=[])
+                print(f"[NEW SESSION] تاریخچه ریست شد برای {chat_guid}")
 
     print(f"[MSG] chat={chat_guid}, private={is_private}, reply_to_bot={is_reply_to_bot}, text={user_text[:80]}")
 
@@ -693,7 +579,7 @@ else:
     # ===== AI =====
     try:
         await asyncio.sleep(random.uniform(3, 6))
-        chat = get_chat_session(chat_guid)  # این الان یا session قدیم رو می‌ده یا جدید
+        chat = get_chat_session(chat_guid)
         
         kb_ctx = ""
         if knowledge_base:
@@ -705,7 +591,7 @@ else:
         ai_text = response.text
         print(f"[AI] پاسخ: {ai_text[:150]}")
 
-        # تشخیص waiting (با حذف ایموجی)
+        # تشخیص waiting
         waiting = False
         clean_text = ai_text.replace("😊", "").replace("❤️", "").replace("✨", "").strip()
         if "از حسن می‌پرسم" in clean_text or "از حسن می‌پرسم و بهت می‌گم" in clean_text:
@@ -713,7 +599,6 @@ else:
         else:
             waiting_keywords = ["نمی‌دونم", "نمی‌دانم", "نمی دونم", "اطلاع ندارم", "می‌پرسم", "ازش می‌پرسم", "بپرسم"]
             waiting = any(kw in ai_text for kw in waiting_keywords)
-        
         print(f"[AI] waiting={waiting}")
 
         if waiting:
@@ -726,8 +611,21 @@ else:
                 "time": datetime.now().strftime("%H:%M:%S")
             }
             pending_replies[pending_id] = pending_item
-            print(f"[PENDING] اضافه شد id={pending_id}, msg_id={message_id}, text={user_text}")
+            print(f"[PENDING] اضافه شد id={pending_id}, msg_id={message_id}")
             save_pending()
+
+            # ارسال اعلان به گروه کنترل (برای فعال‌سازی ریپلای)
+            if OWNER_CONTROL_GROUP:
+                try:
+                    notif = f"❓ سوال جدید: {user_text}\n🆔 چت: {chat_guid}\n⬅️ ریپلای کن تا جواب بدی"
+                    sent_notif = await client.send_message(OWNER_CONTROL_GROUP, notif)
+                    nid = getattr(sent_notif, "message_id", None)
+                    if nid is not None:
+                        pending_replies[str(nid)] = pending_replies.pop(pending_id)
+                        save_pending()
+                        print(f"[NOTIF] اعلان ارسال شد، nid={nid}")
+                except Exception as e:
+                    print(f"[NOTIF ERROR] {e}")
 
             try:
                 sent = await update.reply(ai_text)
@@ -767,7 +665,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("🚀 Bot + Dashboard running")
     print(f"📊 URL: https://your-app.onrender.com/")
-    print(f"📬 Control Group: {'فعال (فقط دریافت پاسخ)' if OWNER_CONTROL_GROUP else 'غیرفعال'}")
+    print(f"📬 Control Group: {'فعال (با اعلان)' if OWNER_CONTROL_GROUP else 'غیرفعال'}")
     print(f"🧠 KB: {len(knowledge_base)} | ⏳ Pending: {len(pending_replies)}")
     print("=" * 50)
     
