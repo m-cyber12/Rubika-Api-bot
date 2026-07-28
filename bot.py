@@ -89,6 +89,7 @@ def save_bot_sent():
 def save_logs():
     save_json(LOG_FILE, chat_logs)
 
+# ---------- Session ----------
 SESSION_FILE = "my_rubika_account.rp"
 part1 = os.environ.get("SESSION_B64_PART1", "")
 part2 = os.environ.get("SESSION_B64_PART2", "")
@@ -135,6 +136,7 @@ def send_msg_sync(guid, text, reply_to=None):
     except Exception as e:
         return False, str(e)
 
+# ---------- Flask ----------
 app = Flask(__name__)
 
 DASHBOARD_HTML = """
@@ -435,7 +437,8 @@ def api_answer():
 def api_logs():
     return jsonify({"logs": chat_logs})
 
-    def get_chat_session(chat_guid):
+    # ---------- ربات روبیکا ----------
+def get_chat_session(chat_guid):
     if chat_guid not in chat_histories:
         chat_histories[chat_guid] = model.start_chat(history=[])
     return chat_histories[chat_guid]
@@ -603,6 +606,7 @@ async def handle_messages(update: Updates):
     except Exception as e:
         print(f"[ERROR] {e}")
 
+# ---------- اجرا ----------
 if __name__ == "__main__":
     load_all()
     
