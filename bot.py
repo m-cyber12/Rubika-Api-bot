@@ -684,7 +684,7 @@ def is_direct_web_request(text):
 
 
 def _format_direct_search_result(raw_result):
-    """نتیجهٔ ابزار را بدون نیاز به یک درخواست دیگر Gemini قابل‌ارسال می‌کند."""
+    """اول خلاصهٔ خوانا می‌سازد و سپس حداکثر سه منبع را نمایش می‌دهد."""
     try:
         payload = json.loads(raw_result)
     except (TypeError, json.JSONDecodeError):
@@ -693,30 +693,44 @@ def _format_direct_search_result(raw_result):
     if not isinstance(payload, dict):
         return str(raw_result)[:3900]
 
-    provider = str(payload.get("provider") or "web")
     answer = str(payload.get("answer") or "").strip()
     sources = payload.get("sources") or []
-    lines = ["🔎 نتیجه جست‌وجو"]
-    if answer and answer != "نتایج خبری تازه به ترتیب فید Google News":
-        lines.extend(["", answer[:1800]])
-
     valid_sources = [item for item in sources if isinstance(item, dict)][:5]
-    if valid_sources:
-        lines.extend(["", "منابع:"])
-        for index, item in enumerate(valid_sources, 1):
-            title = " ".join(str(item.get("title") or "منبع").split())[:220]
-            published = " ".join(str(item.get("published") or "").split())[:80]
-            url = str(item.get("url") or "").strip()[:700]
-            line = f"{index}. {title}"
+    generic_news_answer = "نتایج خبری تازه به ترتیب فید Google News"
+
+    lines = ["📰 خلاصهٔ نتایج"]
+    if answer and answer != generic_news_answer:
+        lines.extend(["", answer[:1800]])
+    elif valid_sources:
+        # وقتی LLM به‌علت quota در دسترس نیست، خلاصهٔ استخراجی از snippetها می‌سازیم.
+        summary_count = 0
+        for item in valid_sources:
+            title = " ".join(str(item.get("title") or "").split())[:180]
+            snippet = " ".join(str(item.get("snippet") or "").split())[:420]
+            published = " ".join(str(item.get("published") or "").split())[:70]
+            summary = snippet or title
+            if not summary:
+                continue
+            bullet = f"• {summary}"
             if published:
-                line += f" — {published}"
-            lines.append(line)
-            if url.startswith(("http://", "https://")):
-                lines.append(url)
+                bullet += f" ({published})"
+            lines.append(bullet)
+            summary_count += 1
+            if summary_count >= 4:
+                break
 
     if not answer and not valid_sources:
         return "متأسفانه هیچ منبع اینترنتی قابل‌استفاده‌ای پیدا نشد."
-    lines.append(f"\nموتور: {provider}")
+
+    if valid_sources:
+        lines.extend(["", "🔗 منابع برای بررسی:"])
+        for index, item in enumerate(valid_sources[:3], 1):
+            title = " ".join(str(item.get("title") or "منبع").split())[:180]
+            url = str(item.get("url") or "").strip()[:700]
+            lines.append(f"{index}. {title}")
+            if url.startswith(("http://", "https://")):
+                lines.append(url)
+
     return "\n".join(lines)[:3900]
 
 
@@ -1892,7 +1906,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase1-agent-v2.2-direct-search",
+        "version": "phase1-agent-v2.3-summary",
         "timestamp": datetime.now().isoformat(),
     })
 
