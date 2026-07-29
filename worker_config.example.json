@@ -1,0 +1,6 @@
+{
+  "server_url": "https://rubika-api-bot-1.onrender.com",
+  "worker_token": "PASTE_THE_SAME_RANDOM_WORKER_TOKEN_FROM_RENDER_HERE",
+  "worker_id": "android-phone",
+  "poll_interval": 3
+}
