@@ -1,13 +1,15 @@
 """
-🤖 دستیار روبیکا – مرحلهٔ اول Agent
+🤖 دستیار روبیکا – مرحلهٔ اول Agent، نسخهٔ ۲
 ═══════════════════════════════════════
 
 این نسخه مستقل از bot.py اصلی ساخته شده و شامل موارد زیر است:
 - Gemini Function Calling برای مالک و داشبورد
-- ابزار جست‌وجوی وب بدون وابستگی جدید
+- جست‌وجوی Google Grounding با همان GEMINI_API_KEY
+- Tavily اختیاری و DuckDuckGo POST/Lite به‌عنوان fallback
 - حافظهٔ بلندمدت امن و پایدار Agent
 - محدودسازی Agent به OWNER_GUIDS
 - احراز هویت Basic/Bearer برای داشبورد Flask
+- جلوگیری از چاپ کلید خصوصی Session روبیکا در لاگ
 - ثبت رویدادهای ابزارها در agent_audit.json
 
 متغیرهای جدید و ضروری:
@@ -17,6 +19,8 @@
 - DASHBOARD_USERNAME=admin
 - GEMINI_MODEL=gemini-flash-latest
 - GEMINI_AGENT_MODEL=gemini-flash-latest
+- GEMINI_SEARCH_MODEL=gemini-flash-latest
+- TAVILY_API_KEY=...              اختیاری؛ fallback مطمئن‌تر جست‌وجو
 - AGENT_MEMORY_FILE=agent_memory.json
 - AGENT_AUDIT_FILE=agent_audit.json
 """
@@ -36,7 +40,7 @@ from datetime import datetime
 from collections import OrderedDict
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from rubpy import Client
@@ -51,6 +55,10 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("rubika-bot")
+
+# rubpy 7.3.5 اطلاعات کامل Session و RSA private key را در سطح INFO چاپ می‌کند.
+# این logger باید پیش از ساخت Client محدود شود.
+logging.getLogger("rubpy.client").setLevel(logging.WARNING)
 
 # ──────────────── تنظیمات ─────────────────
 def _csv_env(name):
@@ -77,6 +85,10 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest").strip()
 GEMINI_AGENT_MODEL = os.environ.get(
     "GEMINI_AGENT_MODEL", GEMINI_MODEL
 ).strip()
+GEMINI_SEARCH_MODEL = os.environ.get(
+    "GEMINI_SEARCH_MODEL", GEMINI_AGENT_MODEL
+).strip()
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "").strip()
 AGENT_MEMORY_FILE = os.environ.get("AGENT_MEMORY_FILE", "agent_memory.json").strip()
 AGENT_AUDIT_FILE = os.environ.get("AGENT_AUDIT_FILE", "agent_audit.json").strip()
 MAX_AGENT_MEMORY_ITEMS = 200
@@ -114,6 +126,8 @@ AGENT_PERSONA = BOT_PERSONA + f"""
 تو همچنین Agent متنی امن {OWNER_NAME} هستی و فقط ابزارهای اعلام‌شده را داری.
 قواعد Agent:
 - برای اطلاعات تازه، قیمت، خبر، وضعیت فعلی یا وقتی کاربر صریحاً جست‌وجو خواست، از search_web استفاده کن.
+- در هر پیام search_web را حداکثر یک بار صدا بزن؛ اگر خطا یا نتیجهٔ خالی بود دوباره تلاش نکن.
+- خروجی search_web ممکن است answer و sources داشته باشد؛ پاسخ را از همان داده بنویس و لینک منابع را حفظ کن.
 - فقط وقتی مالک صریحاً گفت چیزی را به خاطر بسپار، از remember_information استفاده کن.
 - برای بازیابی اطلاعات ذخیره‌شده از recall_information استفاده کن.
 - فقط با درخواست صریح مالک چیزی را از حافظه حذف کن.
@@ -254,13 +268,257 @@ def _normalise_search_url(raw_url):
     return value[:1000]
 
 
+def _post_json(url, payload, headers=None, timeout=WEB_SEARCH_TIMEOUT_SECONDS):
+    request_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "RubikaSafeAgent/2.0",
+    }
+    request_headers.update(headers or {})
+    req = Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=request_headers,
+        method="POST",
+    )
+    with urlopen(req, timeout=timeout) as response:
+        body = response.read(2_000_000).decode("utf-8", errors="replace")
+    parsed = json.loads(body)
+    if not isinstance(parsed, dict):
+        raise ValueError("JSON response is not an object")
+    return parsed
+
+
+def _candidate_text(payload):
+    pieces = []
+    for candidate in payload.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content") or {}
+        for part in content.get("parts", []):
+            if isinstance(part, dict) and part.get("text"):
+                pieces.append(str(part["text"]))
+    return "\n".join(pieces).strip()[:8000]
+
+
+def _grounding_sources(payload):
+    sources = []
+    seen = set()
+    for candidate in payload.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        metadata = (
+            candidate.get("groundingMetadata")
+            or candidate.get("grounding_metadata")
+            or {}
+        )
+        chunks = metadata.get("groundingChunks") or metadata.get("grounding_chunks") or []
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            web = chunk.get("web") or {}
+            uri = str(web.get("uri") or "").strip()
+            title = str(web.get("title") or "").strip()
+            if not uri or uri in seen or not uri.startswith(("http://", "https://")):
+                continue
+            seen.add(uri)
+            sources.append({"title": title[:250], "url": uri[:1200]})
+            if len(sources) >= 8:
+                return sources
+    return sources
+
+
+def _gemini_google_search(query):
+    """Grounded Google Search از REST API؛ به SDK قدیمی پروژه وابسته نیست."""
+    if not GEMINI_API_KEYS:
+        return None
+
+    model_name = GEMINI_SEARCH_MODEL.removeprefix("models/")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", model_name):
+        log.warning("SEARCH Gemini model name is invalid")
+        return None
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:generateContent"
+    )
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [{
+                "text": (
+                    "با جست‌وجوی واقعی Google پاسخ بده. اطلاعات باید تازه و قابل‌استناد "
+                    "باشند و منبع‌ها را حفظ کن. تاریخ فعلی سرور: "
+                    f"{datetime.now().date().isoformat()}\nپرسش: {query}"
+                )
+            }],
+        }],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 2048,
+        },
+    }
+
+    # از کلید فعلی شروع کن و در 429/403 کلید بعدی را فقط برای Search امتحان کن.
+    key_count = len(GEMINI_API_KEYS)
+    for offset in range(key_count):
+        key_index = (CURRENT_KEY_INDEX + offset) % key_count
+        try:
+            data = _post_json(
+                url,
+                payload,
+                headers={"x-goog-api-key": GEMINI_API_KEYS[key_index]},
+                timeout=max(WEB_SEARCH_TIMEOUT_SECONDS, 20),
+            )
+            answer = _candidate_text(data)
+            sources = _grounding_sources(data)
+            if answer:
+                return json.dumps(
+                    {
+                        "provider": "gemini_google_search",
+                        "answer": answer,
+                        "sources": sources,
+                    },
+                    ensure_ascii=False,
+                )
+        except HTTPError as exc:
+            # بدنه خوانده می‌شود تا اتصال آزاد شود، اما برای جلوگیری از افشای داده log نمی‌شود.
+            try:
+                exc.read(2000)
+            except Exception:
+                pass
+            log.warning("SEARCH Gemini Google HTTP %s (key index %s)", exc.code, key_index)
+            if exc.code in {400, 404}:
+                break
+            if exc.code not in {401, 403, 429, 500, 502, 503, 504}:
+                break
+        except (URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            log.warning("SEARCH Gemini Google failed: %s", type(exc).__name__)
+            break
+        except Exception as exc:
+            log.warning("SEARCH Gemini Google internal error: %s", type(exc).__name__)
+            break
+    return None
+
+
+def _tavily_search(query):
+    if not TAVILY_API_KEY:
+        return None
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "basic",
+        "include_answer": True,
+        "include_raw_content": False,
+        "max_results": 5,
+    }
+    try:
+        data = _post_json(
+            "https://api.tavily.com/search",
+            payload,
+            timeout=max(WEB_SEARCH_TIMEOUT_SECONDS, 15),
+        )
+        results = []
+        for item in data.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            results.append({
+                "title": str(item.get("title") or "")[:250],
+                "snippet": str(item.get("content") or "")[:700],
+                "url": url[:1200],
+            })
+            if len(results) >= 5:
+                break
+        answer = str(data.get("answer") or "").strip()[:5000]
+        if results or answer:
+            return json.dumps(
+                {"provider": "tavily", "answer": answer, "sources": results},
+                ensure_ascii=False,
+            )
+    except HTTPError as exc:
+        try:
+            exc.read(1000)
+        except Exception:
+            pass
+        log.warning("SEARCH Tavily HTTP %s", exc.code)
+    except Exception as exc:
+        log.warning("SEARCH Tavily failed: %s", type(exc).__name__)
+    return None
+
+
+def _duckduckgo_search(query):
+    """Fallback رایگان؛ POST شانس بلاک‌شدن روی IP ابری را کمتر می‌کند."""
+    encoded = urlencode({"q": query}).encode("utf-8")
+    requests_to_try = [
+        Request(
+            "https://html.duckduckgo.com/html/",
+            data=encoded,
+            method="POST",
+        ),
+        Request(
+            "https://lite.duckduckgo.com/lite/",
+            data=encoded,
+            method="POST",
+        ),
+        Request(
+            "https://html.duckduckgo.com/html/?q=" + quote_plus(query),
+            method="GET",
+        ),
+    ]
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.7",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    for req in requests_to_try:
+        for name, value in headers.items():
+            req.add_header(name, value)
+        try:
+            with urlopen(req, timeout=WEB_SEARCH_TIMEOUT_SECONDS) as response:
+                charset = response.headers.get_content_charset() or "utf-8"
+                body = response.read(1_000_000).decode(charset, errors="replace")
+            parser = _DuckDuckGoHTMLParser()
+            parser.feed(body)
+            results = []
+            seen = set()
+            for item in parser.results:
+                target = _normalise_search_url(item.get("url"))
+                if not target or target in seen:
+                    continue
+                seen.add(target)
+                results.append({
+                    "title": item.get("title", "")[:250],
+                    "snippet": item.get("snippet", "")[:500],
+                    "url": target,
+                })
+                if len(results) >= 5:
+                    break
+            if results:
+                return json.dumps(
+                    {"provider": "duckduckgo", "answer": "", "sources": results},
+                    ensure_ascii=False,
+                )
+        except Exception as exc:
+            log.info("SEARCH DuckDuckGo fallback failed: %s", type(exc).__name__)
+    return None
+
+
 def search_web(query: str) -> str:
-    """Search the public web for fresh information and return titles, snippets, and URLs.
+    """Search fresh public web data via Google, Tavily, then DuckDuckGo.
 
     Args:
         query: Required search phrase. Do not put secrets or credentials in it.
     """
-    clean_query = " ".join(str(query).split())[:240]
+    clean_query = " ".join(str(query).split())[:300]
     if len(clean_query) < 2:
         return "خطا: عبارت جست‌وجو خیلی کوتاه است."
     if _SECRET_VALUE_RE.search(clean_query) or re.search(
@@ -269,45 +527,37 @@ def search_web(query: str) -> str:
         _audit_tool("search_web", "blocked", "possible credential in query")
         return "جست‌وجو انجام نشد: عبارت احتمالاً شامل اطلاعات ورود یا کلید محرمانه است."
 
-    url = "https://html.duckduckgo.com/html/?q=" + quote_plus(clean_query)
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; RubikaSafeAgent/1.0)",
-            "Accept": "text/html,application/xhtml+xml",
-        },
+    # Automatic function calling گاهی پس از نتیجهٔ خالی ابزار را چند بار صدا می‌زند.
+    cached = getattr(_agent_context, "search_result", None)
+    if cached is not None:
+        _audit_tool("search_web", "cached", "duplicate call prevented")
+        return cached
+
+    providers = [
+        ("gemini_google_search", _gemini_google_search),
+        ("tavily", _tavily_search),
+        ("duckduckgo", _duckduckgo_search),
+    ]
+    errors = []
+    for provider_name, provider in providers:
+        try:
+            result = provider(clean_query)
+        except Exception as exc:
+            result = None
+            errors.append(f"{provider_name}:{type(exc).__name__}")
+        if result:
+            _agent_context.search_result = result
+            _audit_tool("search_web", "ok", f"provider={provider_name}; query={clean_query}")
+            return result
+        errors.append(f"{provider_name}:no_result")
+
+    result = (
+        "هیچ منبع جست‌وجویی نتیجه نداد. Google Grounding و fallbackهای وب "
+        "در دسترس نبودند؛ دوباره search_web را در همین پیام صدا نزن."
     )
-    try:
-        with urlopen(req, timeout=WEB_SEARCH_TIMEOUT_SECONDS) as response:
-            charset = response.headers.get_content_charset() or "utf-8"
-            body = response.read(1_000_000).decode(charset, errors="replace")
-        parser = _DuckDuckGoHTMLParser()
-        parser.feed(body)
-        results = []
-        for item in parser.results:
-            target = _normalise_search_url(item.get("url"))
-            if not target:
-                continue
-            results.append(
-                {
-                    "title": item.get("title", "")[:250],
-                    "snippet": item.get("snippet", "")[:500],
-                    "url": target,
-                }
-            )
-            if len(results) >= 5:
-                break
-        _audit_tool("search_web", "ok", f"query={clean_query}; results={len(results)}")
-        if not results:
-            return "نتیجه‌ای پیدا نشد یا موتور جست‌وجو پاسخ قابل‌خواندن نداد."
-        return json.dumps(results, ensure_ascii=False)
-    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-        _audit_tool("search_web", "error", type(exc).__name__)
-        return f"جست‌وجوی وب موقتاً ناموفق بود: {type(exc).__name__}"
-    except Exception as exc:
-        _audit_tool("search_web", "error", type(exc).__name__)
-        log.exception("WEB SEARCH ERROR")
-        return "جست‌وجوی وب به دلیل خطای داخلی انجام نشد."
+    _agent_context.search_result = result
+    _audit_tool("search_web", "no_results", "; ".join(errors))
+    return result
 
 
 _SENSITIVE_WORDS = {
@@ -1468,7 +1718,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase1-agent",
+        "version": "phase1-agent-v2",
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -1667,6 +1917,11 @@ def api_config():
         "agent": {
             "enabled": bool(agent_model),
             "tools": [func.__name__ for func in AGENT_TOOLS],
+            "search_providers": {
+                "gemini_google_search": bool(GEMINI_API_KEYS),
+                "tavily": bool(TAVILY_API_KEY),
+                "duckduckgo_fallback": True,
+            },
             "memory_items": memory_count,
         },
     })
@@ -1727,10 +1982,11 @@ def get_agent_chat_session(session_key):
 def _send_agent_message(chat, prompt_text, actor):
     _agent_context.actor = actor
     _agent_context.user_prompt = str(prompt_text)[:5000]
+    _agent_context.search_result = None
     try:
         return chat.send_message(prompt_text)
     finally:
-        for field in ("actor", "user_prompt"):
+        for field in ("actor", "user_prompt", "search_result"):
             try:
                 delattr(_agent_context, field)
             except AttributeError:
