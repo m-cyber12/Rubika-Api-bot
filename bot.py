@@ -40,6 +40,7 @@ import base64
 import hmac
 import re
 import time
+import warnings
 import html as html_lib
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -51,6 +52,12 @@ from urllib.request import Request, urlopen
 
 from rubpy import Client
 from rubpy.types import Updates
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r"(?s).*google\.generativeai.*",
+)
 import google.generativeai as genai
 from flask import Flask, Response, request, jsonify, render_template_string
 
@@ -65,6 +72,8 @@ log = logging.getLogger("rubika-bot")
 # rubpy 7.3.5 اطلاعات کامل Session و RSA private key را در سطح INFO چاپ می‌کند.
 # این logger باید پیش از ساخت Client محدود شود.
 logging.getLogger("rubpy.client").setLevel(logging.WARNING)
+# درخواست‌های موفق تکراری داشبورد لاگ را پر نکنند؛ warning/error باقی می‌ماند.
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 # ──────────────── تنظیمات ─────────────────
 def _csv_env(name):
@@ -496,6 +505,101 @@ def _tavily_search(query):
     return None
 
 
+_KNOWN_NEWS_FEEDS = (
+    (
+        ("bbc", "بی بی سی", "بی‌بی‌سی"),
+        "BBC فارسی",
+        "https://feeds.bbci.co.uk/persian/rss.xml",
+    ),
+    (
+        ("citna", "سیتنا"),
+        "سیتنا",
+        "https://www.citna.ir/rss.xml",
+    ),
+)
+
+
+def _requested_result_count(query, default=3):
+    value = str(query or "").casefold().translate(
+        str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    )
+    match = re.search(r"\b([1-5])\s*(?:تا|عدد|خبر|مورد)", value)
+    if match:
+        return int(match.group(1))
+    words = {"یک": 1, "دو": 2, "سه": 3, "چهار": 4, "پنج": 5}
+    for word, count in words.items():
+        if re.search(rf"(?:^|\s){word}\s*(?:تا|عدد|خبر|مورد)", value):
+            return count
+    return default
+
+
+def _rss_items(body, limit):
+    root = ET.fromstring(body)
+    results = []
+    seen = set()
+    for item in root.findall(".//item"):
+        title = " ".join((item.findtext("title") or "").split())
+        link = (item.findtext("link") or "").strip()
+        published = " ".join((item.findtext("pubDate") or "").split())
+        description = item.findtext("description") or ""
+        description = html_lib.unescape(re.sub(r"<[^>]+>", " ", description))
+        description = " ".join(description.split())
+        if not title or not link.startswith(("http://", "https://")) or link in seen:
+            continue
+        seen.add(link)
+        results.append({
+            "title": title[:300],
+            "snippet": description[:700],
+            "published": published[:100],
+            "url": link[:1200],
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _known_site_feed_search(query):
+    """برای سایت‌های شناخته‌شده، جدیدترین خبر را مستقیماً از RSS رسمی می‌گیرد."""
+    value = " ".join(str(query or "").casefold().split())
+    selected = None
+    for aliases, source_name, feed_url in _KNOWN_NEWS_FEEDS:
+        if any(alias in value for alias in aliases):
+            selected = (source_name, feed_url)
+            break
+    if not selected:
+        return None
+
+    source_name, feed_url = selected
+    count = _requested_result_count(query)
+    req = Request(
+        feed_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; RubikaSafeAgent/2.4)",
+            "Accept": "application/rss+xml,application/xml,text/xml",
+        },
+    )
+    try:
+        with urlopen(req, timeout=WEB_SEARCH_TIMEOUT_SECONDS) as response:
+            body = response.read(1_500_000)
+        results = _rss_items(body, count)
+        if not results:
+            return None
+        answer_lines = [f"{len(results)} خبر تازه از {source_name}:"]
+        for index, item in enumerate(results, 1):
+            answer_lines.append(f"{index}. {item['title']}")
+        return json.dumps(
+            {
+                "provider": "official_rss",
+                "answer": "\n".join(answer_lines),
+                "sources": results,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        log.info("SEARCH official RSS failed for %s: %s", source_name, type(exc).__name__)
+        return None
+
+
 def _is_news_query(query):
     lowered = str(query).casefold()
     markers = (
@@ -643,9 +747,10 @@ def search_web(query: str) -> str:
         return cached
 
     providers = [
-        ("gemini_google_search", _gemini_google_search),
+        ("official_rss", _known_site_feed_search),
         ("tavily", _tavily_search),
         ("google_news_rss", _google_news_search),
+        ("gemini_google_search", _gemini_google_search),
         ("duckduckgo", _duckduckgo_search),
     ]
     errors = []
@@ -675,12 +780,21 @@ def is_direct_web_request(text):
     value = " ".join(str(text or "").casefold().split())
     markers = (
         "جستجو", "جست‌وجو", "سرچ", "در وب", "اینترنت",
-        "آخرین خبر", "آخرین اخبار", "خبر سایت", "خبرهای",
-        "اخبار امروز", "قیمت امروز", "آب و هوا", "وضعیت هوا",
+        "قیمت امروز", "آب و هوا", "وضعیت هوا",
         "search the web", "web search", "latest news", "breaking news",
         "current price", "weather today",
     )
-    return any(marker in value for marker in markers)
+    if any(marker in value for marker in markers):
+        return True
+
+    # حالت‌های طبیعی مثل «سه تا خبر آخر BBC» یا «خبر جدید سایت...»
+    if "خبر" in value or "اخبار" in value:
+        news_qualifiers = (
+            "آخر", "جدید", "تازه", "مهم", "امروز", "سایت", "بخون", "بخوان",
+            "bbc", "بی بی سی", "بی‌بی‌سی", "citna", "سیتنا",
+        )
+        return any(marker in value for marker in news_qualifiers)
+    return False
 
 
 def _format_direct_search_result(raw_result):
@@ -1881,12 +1995,14 @@ async function updateStats(){
     document.getElementById('st-pen').textContent=d.pen;
     document.getElementById('st-log').textContent=d.today;
   }catch(e){}
+}
+async function updateApiStatus(){
   try{
     const r=await fetch('/api/config');const d=await r.json();
     document.getElementById('st-keys').textContent=d.env?.GEMINI_API_KEY?'فعال':'غیرفعال';
   }catch(e){}
 }
-updateStats();setInterval(updateStats,5000);
+updateStats();updateApiStatus();setInterval(updateStats,30000);
 </script>
 </body>
 </html>
@@ -1906,7 +2022,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase1-agent-v2.3-summary",
+        "version": "phase1-agent-v2.4-rss-loop-fix",
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -2114,9 +2230,10 @@ def api_config():
             "enabled": bool(agent_model),
             "tools": [func.__name__ for func in AGENT_TOOLS],
             "search_providers": {
-                "gemini_google_search": bool(GEMINI_API_KEYS),
+                "official_rss": True,
                 "tavily": bool(TAVILY_API_KEY),
                 "google_news_rss": True,
+                "gemini_google_search": bool(GEMINI_API_KEYS),
                 "duckduckgo_fallback": True,
             },
             "owner_guid_masks": [_mask_guid(guid) for guid in sorted(OWNER_GUIDS)],
