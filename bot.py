@@ -21,6 +21,9 @@
 - GEMINI_AGENT_MODEL=gemini-flash-latest
 - GEMINI_SEARCH_MODEL=gemini-flash-latest
 - TAVILY_API_KEY=...              اختیاری؛ fallback مطمئن‌تر جست‌وجو
+- REPLY_DELAY_MIN=0.1
+- REPLY_DELAY_MAX=0.4
+- GEMINI_SEARCH_COOLDOWN_SECONDS=600
 - AGENT_MEMORY_FILE=agent_memory.json
 - AGENT_AUDIT_FILE=agent_audit.json
 """
@@ -36,6 +39,9 @@ import uuid
 import base64
 import hmac
 import re
+import time
+import html as html_lib
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from collections import OrderedDict
 from html.parser import HTMLParser
@@ -62,11 +68,25 @@ logging.getLogger("rubpy.client").setLevel(logging.WARNING)
 
 # ──────────────── تنظیمات ─────────────────
 def _csv_env(name):
-    return frozenset(
-        item.strip()
-        for item in os.environ.get(name, "").split(",")
-        if item.strip()
-    )
+    """CSV انعطاف‌پذیر: کوتیشن، براکت، و OWNER_GUIDS= داخل value را اصلاح می‌کند."""
+    raw = os.environ.get(name, "")
+    raw = raw.replace("،", ",").replace(";", ",").replace("\n", ",")
+    values = []
+    for item in raw.split(","):
+        clean = item.strip().strip("[](){} \t\r\n'\"")
+        if clean.casefold().startswith((name + "=").casefold()):
+            clean = clean.split("=", 1)[1].strip().strip("'\"")
+        if clean:
+            values.append(clean)
+    return frozenset(values)
+
+
+def _float_env(name, default, minimum=0.0, maximum=60.0):
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = float(default)
+    return max(minimum, min(maximum, value))
 
 
 _raw_keys = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -94,10 +114,17 @@ AGENT_AUDIT_FILE = os.environ.get("AGENT_AUDIT_FILE", "agent_audit.json").strip(
 MAX_AGENT_MEMORY_ITEMS = 200
 MAX_AGENT_AUDIT_ITEMS = 1000
 MAX_AGENT_HISTORY_ITEMS = 40
-WEB_SEARCH_TIMEOUT_SECONDS = 10
+WEB_SEARCH_TIMEOUT_SECONDS = _float_env("WEB_SEARCH_TIMEOUT_SECONDS", 7, 3, 20)
+REPLY_DELAY_MIN = _float_env("REPLY_DELAY_MIN", 0.1, 0, 5)
+REPLY_DELAY_MAX = _float_env("REPLY_DELAY_MAX", 0.4, REPLY_DELAY_MIN, 8)
+GEMINI_SEARCH_COOLDOWN_SECONDS = _float_env(
+    "GEMINI_SEARCH_COOLDOWN_SECONDS", 600, 30, 3600
+)
 
 _agent_memory_lock = threading.RLock()
 _agent_audit_lock = threading.Lock()
+_grounding_state_lock = threading.Lock()
+_grounding_blocked_until = 0.0
 _agent_context = threading.local()
 
 if not GEMINI_API_KEYS:
@@ -329,9 +356,15 @@ def _grounding_sources(payload):
 
 
 def _gemini_google_search(query):
-    """Grounded Google Search از REST API؛ به SDK قدیمی پروژه وابسته نیست."""
+    """Grounded Google Search با circuit breaker برای جلوگیری از تأخیر 429."""
+    global _grounding_blocked_until
     if not GEMINI_API_KEYS:
         return None
+
+    now = time.monotonic()
+    with _grounding_state_lock:
+        if now < _grounding_blocked_until:
+            return None
 
     model_name = GEMINI_SEARCH_MODEL.removeprefix("models/")
     if not re.fullmatch(r"[A-Za-z0-9._-]+", model_name):
@@ -362,6 +395,7 @@ def _gemini_google_search(query):
 
     # از کلید فعلی شروع کن و در 429/403 کلید بعدی را فقط برای Search امتحان کن.
     key_count = len(GEMINI_API_KEYS)
+    quota_failures = 0
     for offset in range(key_count):
         key_index = (CURRENT_KEY_INDEX + offset) % key_count
         try:
@@ -369,7 +403,7 @@ def _gemini_google_search(query):
                 url,
                 payload,
                 headers={"x-goog-api-key": GEMINI_API_KEYS[key_index]},
-                timeout=max(WEB_SEARCH_TIMEOUT_SECONDS, 20),
+                timeout=max(WEB_SEARCH_TIMEOUT_SECONDS, 12),
             )
             answer = _candidate_text(data)
             sources = _grounding_sources(data)
@@ -389,6 +423,8 @@ def _gemini_google_search(query):
             except Exception:
                 pass
             log.warning("SEARCH Gemini Google HTTP %s (key index %s)", exc.code, key_index)
+            if exc.code in {403, 429}:
+                quota_failures += 1
             if exc.code in {400, 404}:
                 break
             if exc.code not in {401, 403, 429, 500, 502, 503, 504}:
@@ -399,6 +435,16 @@ def _gemini_google_search(query):
         except Exception as exc:
             log.warning("SEARCH Gemini Google internal error: %s", type(exc).__name__)
             break
+
+    if quota_failures >= key_count:
+        with _grounding_state_lock:
+            _grounding_blocked_until = (
+                time.monotonic() + GEMINI_SEARCH_COOLDOWN_SECONDS
+            )
+        log.warning(
+            "SEARCH Gemini Google paused for %ss; using fast fallbacks",
+            int(GEMINI_SEARCH_COOLDOWN_SECONDS),
+        )
     return None
 
 
@@ -447,6 +493,69 @@ def _tavily_search(query):
         log.warning("SEARCH Tavily HTTP %s", exc.code)
     except Exception as exc:
         log.warning("SEARCH Tavily failed: %s", type(exc).__name__)
+    return None
+
+
+def _is_news_query(query):
+    lowered = str(query).casefold()
+    markers = (
+        "خبر", "اخبار", "تازه", "امروز", "آخرین", "news", "latest",
+        "headline", "breaking",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _google_news_search(query):
+    """Fallback سریع و بدون کلید برای درخواست‌های خبری."""
+    if not _is_news_query(query):
+        return None
+    url = (
+        "https://news.google.com/rss/search?q="
+        + quote_plus(query)
+        + "&hl=en-US&gl=US&ceid=US:en"
+    )
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; RubikaSafeAgent/2.1)",
+            "Accept": "application/rss+xml,application/xml,text/xml",
+        },
+    )
+    try:
+        with urlopen(req, timeout=WEB_SEARCH_TIMEOUT_SECONDS) as response:
+            body = response.read(1_000_000)
+        root = ET.fromstring(body)
+        results = []
+        seen = set()
+        for item in root.findall(".//item"):
+            title = " ".join((item.findtext("title") or "").split())
+            link = (item.findtext("link") or "").strip()
+            published = " ".join((item.findtext("pubDate") or "").split())
+            description = item.findtext("description") or ""
+            description = html_lib.unescape(re.sub(r"<[^>]+>", " ", description))
+            description = " ".join(description.split())
+            if not title or not link.startswith(("http://", "https://")) or link in seen:
+                continue
+            seen.add(link)
+            results.append({
+                "title": title[:300],
+                "snippet": description[:600],
+                "published": published[:100],
+                "url": link[:1200],
+            })
+            if len(results) >= 6:
+                break
+        if results:
+            return json.dumps(
+                {
+                    "provider": "google_news_rss",
+                    "answer": "نتایج خبری تازه به ترتیب فید Google News",
+                    "sources": results,
+                },
+                ensure_ascii=False,
+            )
+    except Exception as exc:
+        log.info("SEARCH Google News fallback failed: %s", type(exc).__name__)
     return None
 
 
@@ -536,6 +645,7 @@ def search_web(query: str) -> str:
     providers = [
         ("gemini_google_search", _gemini_google_search),
         ("tavily", _tavily_search),
+        ("google_news_rss", _google_news_search),
         ("duckduckgo", _duckduckgo_search),
     ]
     errors = []
@@ -1718,7 +1828,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase1-agent-v2",
+        "version": "phase1-agent-v2.1-fast",
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -1920,8 +2030,11 @@ def api_config():
             "search_providers": {
                 "gemini_google_search": bool(GEMINI_API_KEYS),
                 "tavily": bool(TAVILY_API_KEY),
+                "google_news_rss": True,
                 "duckduckgo_fallback": True,
             },
+            "owner_guid_masks": [_mask_guid(guid) for guid in sorted(OWNER_GUIDS)],
+            "reply_delay_seconds": [REPLY_DELAY_MIN, REPLY_DELAY_MAX],
             "memory_items": memory_count,
         },
     })
@@ -1930,6 +2043,15 @@ def api_config():
 # ════════════════════════════════════════
 #  ربات روبیکا – هندلر پیام‌ها و Agent امن
 # ════════════════════════════════════════
+
+def _mask_guid(value):
+    clean = str(value or "").strip()
+    if not clean:
+        return "-"
+    if len(clean) <= 8:
+        return "***" + clean[-3:]
+    return clean[:2] + "***" + clean[-6:]
+
 
 def is_owner_message(author_guid, chat_guid):
     """Agent فقط برای GUIDهای صریحاً مجاز فعال می‌شود."""
@@ -2127,6 +2249,14 @@ async def handle_messages(update: Updates):
     if not user_text:
         return
 
+    log.info(
+        "ROUTE owner=%s chat=%s author=%s configured=%s",
+        owner_authorized,
+        _mask_guid(chat_guid),
+        _mask_guid(author_guid),
+        ",".join(_mask_guid(guid) for guid in sorted(OWNER_GUIDS)) or "none",
+    )
+
     # ──── ثبت لاگ ────
     with _lock_logs:
         chat_logs.append({
@@ -2260,7 +2390,7 @@ async def handle_messages(update: Updates):
 
     if kb_answer:
         try:
-            await asyncio.sleep(random.uniform(1, 3))
+            await asyncio.sleep(random.uniform(REPLY_DELAY_MIN, REPLY_DELAY_MAX))
             sent = await update.reply(kb_answer)
             sid = _extract_msg_id(sent)
             if sid is not None:
@@ -2276,7 +2406,7 @@ async def handle_messages(update: Updates):
 
     # ──── پاسخ از AI ────
     try:
-        await asyncio.sleep(random.uniform(3, 6))
+        await asyncio.sleep(random.uniform(REPLY_DELAY_MIN, REPLY_DELAY_MAX))
         
         # context دانش
         with _lock_kb:
@@ -2374,8 +2504,12 @@ async def handle_messages(update: Updates):
                     bot_sent_message_ids.add(sid)
                     _trim_bot_sent_ids()
                 save_bot_sent()
-                log.info(f"AI  tracked sent_msg_id={sid}")
-            log.info("AI  پاسخ مستقیم")
+                log.info(
+                    "%s  tracked sent_msg_id=%s",
+                    "AGENT" if owner_authorized else "AI",
+                    sid,
+                )
+            log.info("%s  پاسخ مستقیم", "AGENT" if owner_authorized else "AI")
 
         # تاریخچه Agent داخل helper با حفظ سلامت زوج‌های function call مدیریت می‌شود.
         if chat and not owner_authorized:
@@ -2407,6 +2541,9 @@ if __name__ == "__main__":
     print("🚀 Bot + Dashboard running")
     print(f"📬 Control Group : {OWNER_CONTROL_GROUP or 'غیرفعال'}")
     print(f"👤 Agent Owners  : {'✅ ' + str(len(OWNER_GUIDS)) + ' GUID' if OWNER_GUIDS else '❌ OWNER_GUIDS تنظیم نشده'}")
+    if OWNER_GUIDS:
+        print("🔎 Owner Masks   : " + ", ".join(_mask_guid(g) for g in sorted(OWNER_GUIDS)))
+    print(f"⚡ Reply Delay   : {REPLY_DELAY_MIN:.1f}–{REPLY_DELAY_MAX:.1f}s")
     print(f"🔐 Dashboard     : {'✅ محافظت‌شده' if DASHBOARD_PASSWORD else '🔒 قفل؛ DASHBOARD_PASSWORD تنظیم نشده'}")
     print(f"🔑 Gemini API    : {'✅ فعال (' + str(len(GEMINI_API_KEYS)) + ' کلید)' if GEMINI_API_KEYS else '❌ غیرفعال'}")
     print(f"🔑 Rubika Session: {'✅ موجود' if os.path.exists(SESSION_FILE) else '❌ ناموجود'}")
