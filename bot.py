@@ -343,216 +343,629 @@ DASHBOARD_HTML = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>دستیار روبیکا</title>
+<title>دستیار روبیکا | پنل مدرن</title>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Tahoma,sans-serif;background:#0d1117;color:#c9d1d9;padding:12px}
-.container{max-width:900px;margin:0 auto}
-h1{color:#58a6ff;text-align:center;margin-bottom:12px;font-size:20px}
-.stats{display:flex;gap:10px;margin-bottom:12px;justify-content:center;flex-wrap:wrap}
-.stat{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:10px 18px;text-align:center;min-width:90px}
-.stat .num{font-size:24px;font-weight:bold;color:#3fb950}
-.stat .label{font-size:11px;color:#8b949e;margin-top:3px}
-.tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;justify-content:center}
-.tab{background:#21262d;border:1px solid #30363d;border-radius:8px;padding:9px 14px;cursor:pointer;font-size:13px;transition:.2s;color:#c9d1d9}
-.tab:hover{background:#30363d}
-.tab.active{background:#238636;color:#fff;border-color:#238636;font-weight:bold}
-.panel{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:14px;display:none}
+:root{
+  --bg-primary:#0a0a0f;
+  --bg-secondary:#12121a;
+  --bg-card:rgba(18,18,26,0.8);
+  --bg-glass:rgba(255,255,255,0.03);
+  --accent-1:#00d4ff;
+  --accent-2:#7c3aed;
+  --accent-3:#f472b6;
+  --accent-4:#34d399;
+  --text-primary:#f0f0f5;
+  --text-secondary:#8888a0;
+  --border:rgba(255,255,255,0.06);
+  --glow-1:0 0 30px rgba(0,212,255,0.3);
+  --glow-2:0 0 30px rgba(124,58,237,0.3);
+  --glow-3:0 0 30px rgba(244,114,182,0.3);
+  --radius:16px;
+  --radius-sm:10px;
+  --transition:all 0.3s cubic-bezier(0.4,0,0.2,1);
+}
+body{
+  font-family:'Vazirmatn',sans-serif;
+  background:var(--bg-primary);
+  color:var(--text-primary);
+  min-height:100vh;
+  overflow-x:hidden;
+}
+body::before{
+  content:'';position:fixed;top:0;left:0;right:0;bottom:0;
+  background:
+    radial-gradient(ellipse 800px 600px at 20% 20%, rgba(0,212,255,0.08) 0%, transparent 60%),
+    radial-gradient(ellipse 600px 800px at 80% 80%, rgba(124,58,237,0.08) 0%, transparent 60%),
+    radial-gradient(ellipse 500px 500px at 50% 50%, rgba(244,114,182,0.05) 0%, transparent 60%);
+  pointer-events:none;z-index:0;
+}
+.app{display:flex;min-height:100vh;position:relative;z-index:1}
+
+/* ───── Sidebar ───── */
+.sidebar{
+  width:260px;min-height:100vh;background:var(--bg-secondary);
+  border-left:1px solid var(--border);padding:24px 16px;
+  display:flex;flex-direction:column;position:fixed;right:0;top:0;bottom:0;
+  backdrop-filter:blur(20px);z-index:100;
+}
+.sidebar-logo{
+  text-align:center;margin-bottom:32px;padding:20px;
+  background:linear-gradient(135deg,rgba(0,212,255,0.1),rgba(124,58,237,0.1));
+  border-radius:var(--radius);border:1px solid var(--border);
+}
+.sidebar-logo h1{
+  font-size:20px;font-weight:900;
+  background:linear-gradient(135deg,var(--accent-1),var(--accent-2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+}
+.sidebar-logo p{font-size:11px;color:var(--text-secondary);margin-top:4px}
+.nav{flex:1;display:flex;flex-direction:column;gap:4px}
+.nav-item{
+  display:flex;align-items:center;gap:12px;padding:12px 16px;
+  border-radius:var(--radius-sm);cursor:pointer;transition:var(--transition);
+  color:var(--text-secondary);font-size:14px;font-weight:500;
+  border:1px solid transparent;position:relative;overflow:hidden;
+}
+.nav-item:hover{background:var(--bg-glass);color:var(--text-primary);border-color:var(--border)}
+.nav-item.active{
+  background:linear-gradient(135deg,rgba(0,212,255,0.15),rgba(124,58,237,0.15));
+  color:var(--accent-1);border-color:rgba(0,212,255,0.2);
+  box-shadow:var(--glow-1);
+}
+.nav-item.active::before{
+  content:'';position:absolute;right:0;top:50%;transform:translateY(-50%);
+  width:3px;height:60%;background:linear-gradient(180deg,var(--accent-1),var(--accent-2));
+  border-radius:0 4px 4px 0;
+}
+.nav-item i{font-size:18px;width:24px;text-align:center}
+.sidebar-footer{
+  padding:16px;background:var(--bg-glass);border-radius:var(--radius-sm);
+  border:1px solid var(--border);margin-top:auto;
+}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--accent-4);display:inline-block;margin-left:8px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+
+/* ───── Main Content ───── */
+.main{flex:1;padding:24px;margin-right:260px}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+.header h2{font-size:24px;font-weight:700}
+.header-actions{display:flex;gap:12px}
+.header-btn{
+  padding:10px 20px;border-radius:var(--radius-sm);border:1px solid var(--border);
+  background:var(--bg-glass);color:var(--text-primary);cursor:pointer;
+  font-family:inherit;font-size:13px;transition:var(--transition);
+  backdrop-filter:blur(10px);
+}
+.header-btn:hover{border-color:var(--accent-1);box-shadow:var(--glow-1)}
+
+/* ───── Stats Cards ───── */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:24px}
+.stat-card{
+  background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);
+  padding:20px;position:relative;overflow:hidden;transition:var(--transition);
+  backdrop-filter:blur(10px);
+}
+.stat-card:hover{transform:translateY(-4px);border-color:var(--accent-1);box-shadow:var(--glow-1)}
+.stat-card::before{
+  content:'';position:absolute;top:0;right:0;width:100%;height:3px;
+  background:linear-gradient(90deg,var(--accent-1),var(--accent-2));
+}
+.stat-card:nth-child(2)::before{background:linear-gradient(90deg,var(--accent-2),var(--accent-3))}
+.stat-card:nth-child(3)::before{background:linear-gradient(90deg,var(--accent-3),var(--accent-4))}
+.stat-card:nth-child(4)::before{background:linear-gradient(90deg,var(--accent-4),var(--accent-1))}
+.stat-icon{
+  width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+  font-size:20px;margin-bottom:12px;
+}
+.stat-card:nth-child(1) .stat-icon{background:rgba(0,212,255,0.1);color:var(--accent-1)}
+.stat-card:nth-child(2) .stat-icon{background:rgba(124,58,237,0.1);color:var(--accent-2)}
+.stat-card:nth-child(3) .stat-icon{background:rgba(244,114,182,0.1);color:var(--accent-3)}
+.stat-card:nth-child(4) .stat-icon{background:rgba(52,211,153,0.1);color:var(--accent-4)}
+.stat-value{font-size:32px;font-weight:900;margin-bottom:4px}
+.stat-label{font-size:13px;color:var(--text-secondary)}
+
+/* ───── Panels ───── */
+.panel{display:none;animation:fadeIn 0.4s ease}
 .panel.active{display:block}
-input,textarea{width:100%;padding:10px;border-radius:6px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9;margin-bottom:8px;font-family:inherit;font-size:14px}
-textarea{min-height:70px;resize:vertical}
-button{background:#238636;color:#fff;border:none;padding:9px 18px;border-radius:6px;cursor:pointer;font-size:14px}
-button:hover{background:#2ea043}
-.btn-red{background:#da3633}
-.btn-red:hover{background:#f85149}
-.msg-box{height:220px;overflow-y:auto;border:1px solid #30363d;border-radius:6px;padding:10px;margin-bottom:8px;background:#0d1117}
-.msg{padding:7px 9px;border-radius:6px;margin-bottom:5px;font-size:13px;line-height:1.5}
-.msg-u{background:#1f6feb18;border-right:3px solid #58a6ff}
-.msg-a{background:#23863618;border-right:3px solid #3fb950}
-.kb-item,.pending-item{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px;margin-bottom:8px}
-.kb-item{display:flex;gap:10px;align-items:flex-start}
-.kb-item div,.pending-item div{flex:1;font-size:13px}
-.pending-row{display:flex;gap:8px;margin-bottom:10px;align-items:center}
-.pending-row input{flex:1;margin:0}
-.small{color:#8b949e;font-size:12px}
-hr{border:0;border-top:1px solid #30363d;margin:10px 0}
-.empty{text-align:center;color:#8b949e;padding:20px;font-size:13px}
-.env-ok{color:#3fb950}
-.env-miss{color:#da3633}
+@keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.card{
+  background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);
+  padding:20px;margin-bottom:16px;backdrop-filter:blur(10px);transition:var(--transition);
+}
+.card:hover{border-color:rgba(255,255,255,0.1)}
+.card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.card-title{font-size:16px;font-weight:700;display:flex;align-items:center;gap:8px}
+.card-title i{color:var(--accent-1)}
+
+/* ───── Chat Box ───── */
+.chat-container{display:flex;flex-direction:column;height:500px}
+.chat-messages{
+  flex:1;overflow-y:auto;padding:16px;border-radius:var(--radius-sm);
+  background:var(--bg-primary);border:1px solid var(--border);margin-bottom:12px;
+}
+.chat-messages::-webkit-scrollbar{width:6px}
+.chat-messages::-webkit-scrollbar-track{background:transparent}
+.chat-messages::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.msg{
+  padding:12px 16px;border-radius:12px;margin-bottom:8px;font-size:14px;
+  line-height:1.7;max-width:85%;animation:msgIn 0.3s ease;
+}
+@keyframes msgIn{from{opacity:0;transform:scale(0.95)}to{opacity:1;transform:scale(1)}}
+.msg-user{
+  background:linear-gradient(135deg,rgba(0,212,255,0.15),rgba(0,212,255,0.05));
+  border:1px solid rgba(0,212,255,0.2);margin-left:auto;border-bottom-right-radius:4px;
+}
+.msg-ai{
+  background:linear-gradient(135deg,rgba(124,58,237,0.15),rgba(124,58,237,0.05));
+  border:1px solid rgba(124,58,237,0.2);margin-right:auto;border-bottom-left-radius:4px;
+}
+.msg-meta{font-size:11px;color:var(--text-secondary);margin-top:4px;display:flex;align-items:center;gap:6px}
+.msg-meta i{font-size:10px}
+.chat-input-wrap{display:flex;gap:10px}
+.chat-input{
+  flex:1;padding:14px 18px;border-radius:var(--radius-sm);border:1px solid var(--border);
+  background:var(--bg-primary);color:var(--text-primary);font-family:inherit;font-size:14px;
+  transition:var(--transition);outline:none;
+}
+.chat-input:focus{border-color:var(--accent-1);box-shadow:var(--glow-1)}
+.chat-input::placeholder{color:var(--text-secondary)}
+.send-btn{
+  padding:14px 24px;border-radius:var(--radius-sm);border:none;
+  background:linear-gradient(135deg,var(--accent-1),var(--accent-2));
+  color:#fff;font-family:inherit;font-size:14px;font-weight:600;
+  cursor:pointer;transition:var(--transition);display:flex;align-items:center;gap:8px;
+}
+.send-btn:hover{transform:scale(1.02);box-shadow:var(--glow-1)}
+
+/* ───── Forms ───── */
+.form-group{margin-bottom:16px}
+.form-label{display:block;font-size:13px;color:var(--text-secondary);margin-bottom:8px;font-weight:500}
+.form-input,.form-textarea{
+  width:100%;padding:12px 16px;border-radius:var(--radius-sm);border:1px solid var(--border);
+  background:var(--bg-primary);color:var(--text-primary);font-family:inherit;font-size:14px;
+  transition:var(--transition);outline:none;
+}
+.form-input:focus,.form-textarea:focus{border-color:var(--accent-1);box-shadow:var(--glow-1)}
+.form-textarea{min-height:100px;resize:vertical}
+.form-input::placeholder,.form-textarea::placeholder{color:var(--text-secondary)}
+.btn{
+  padding:12px 24px;border-radius:var(--radius-sm);border:none;
+  font-family:inherit;font-size:14px;font-weight:600;cursor:pointer;
+  transition:var(--transition);display:inline-flex;align-items:center;gap:8px;
+}
+.btn-primary{background:linear-gradient(135deg,var(--accent-1),var(--accent-2));color:#fff}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:var(--glow-1)}
+.btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff}
+.btn-danger:hover{transform:translateY(-2px);box-shadow:0 0 20px rgba(239,68,68,0.3)}
+.btn-success{background:linear-gradient(135deg,var(--accent-4),#059669);color:#fff}
+.btn-success:hover{transform:translateY(-2px);box-shadow:0 0 20px rgba(52,211,153,0.3)}
+.btn-sm{padding:8px 16px;font-size:12px}
+
+/* ───── Items List ───── */
+.item-list{display:flex;flex-direction:column;gap:10px}
+.item-card{
+  background:var(--bg-primary);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:16px;display:flex;gap:12px;align-items:flex-start;transition:var(--transition);
+}
+.item-card:hover{border-color:rgba(255,255,255,0.1);transform:translateX(-4px)}
+.item-content{flex:1}
+.item-content b{font-size:13px;color:var(--accent-1)}
+.item-content p{font-size:13px;color:var(--text-secondary);margin-top:4px;line-height:1.6}
+.item-actions{display:flex;gap:6px}
+
+/* ───── Pending Items ───── */
+.pending-card{
+  background:var(--bg-primary);border:1px solid rgba(244,114,182,0.2);
+  border-radius:var(--radius-sm);padding:16px;margin-bottom:12px;
+  transition:var(--transition);
+}
+.pending-card:hover{border-color:var(--accent-3);box-shadow:var(--glow-3)}
+.pending-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.pending-id{
+  font-size:12px;font-weight:700;padding:4px 10px;border-radius:20px;
+  background:rgba(244,114,182,0.15);color:var(--accent-3);
+}
+.pending-time{font-size:11px;color:var(--text-secondary)}
+.pending-text{font-size:14px;line-height:1.7;margin-bottom:12px}
+.pending-input-wrap{display:flex;gap:8px}
+.pending-input{
+  flex:1;padding:10px 14px;border-radius:var(--radius-sm);border:1px solid var(--border);
+  background:var(--bg-primary);color:var(--text-primary);font-family:inherit;font-size:13px;
+  outline:none;transition:var(--transition);
+}
+.pending-input:focus{border-color:var(--accent-3);box-shadow:var(--glow-3)}
+
+/* ───── Logs ───── */
+.log-item{
+  padding:12px 16px;border-radius:var(--radius-sm);background:var(--bg-primary);
+  border:1px solid var(--border);margin-bottom:8px;font-size:13px;
+  transition:var(--transition);
+}
+.log-item:hover{border-color:rgba(255,255,255,0.1)}
+.log-time{color:var(--accent-1);font-weight:600;font-size:12px}
+.log-guid{color:var(--text-secondary);font-size:11px;margin:0 8px}
+.log-from{color:var(--accent-2);font-weight:600}
+.log-text{color:var(--text-primary);margin-top:4px;line-height:1.6}
+
+/* ───── Config Table ───── */
+.config-table{width:100%;border-collapse:separate;border-spacing:0}
+.config-table th{
+  padding:12px 16px;text-align:right;font-size:12px;color:var(--text-secondary);
+  border-bottom:1px solid var(--border);font-weight:600;text-transform:uppercase;
+  letter-spacing:0.5px;
+}
+.config-table td{
+  padding:12px 16px;border-bottom:1px solid var(--border);font-size:14px;
+}
+.config-table tr:hover td{background:var(--bg-glass)}
+.config-badge{
+  padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;
+  display:inline-flex;align-items:center;gap:6px;
+}
+.config-badge.ok{background:rgba(52,211,153,0.15);color:var(--accent-4)}
+.config-badge.error{background:rgba(239,68,68,0.15);color:#ef4444}
+.config-badge i{font-size:10px}
+
+/* ───── Empty State ───── */
+.empty-state{
+  text-align:center;padding:40px 20px;color:var(--text-secondary);
+}
+.empty-state i{font-size:48px;margin-bottom:16px;opacity:0.3}
+.empty-state p{font-size:14px}
+
+/* ───── Guide Box ───── */
+.guide-box{
+  background:linear-gradient(135deg,rgba(0,212,255,0.05),rgba(124,58,237,0.05));
+  border:1px solid rgba(0,212,255,0.2);border-radius:var(--radius-sm);
+  padding:16px;margin-top:16px;
+}
+.guide-box h4{color:var(--accent-1);font-size:14px;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.guide-box p{font-size:13px;color:var(--text-secondary);line-height:1.8}
+
+/* ───── Responsive ───── */
+@media(max-width:768px){
+  .sidebar{display:none}
+  .main{margin-right:0}
+  .stats-grid{grid-template-columns:1fr 1fr}
+  .header{flex-direction:column;gap:12px;align-items:flex-start}
+}
+
+/* ───── Scrollbar ───── */
+::-webkit-scrollbar{width:8px}
+::-webkit-scrollbar-track{background:var(--bg-primary)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,0.1)}
+
+/* ───── Loading Spinner ───── */
+.spinner{
+  width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--accent-1);
+  border-radius:50%;animation:spin 0.8s linear infinite;display:inline-block;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ───── Toast Notification ───── */
+.toast{
+  position:fixed;bottom:24px;left:24px;padding:14px 20px;border-radius:var(--radius-sm);
+  background:var(--bg-secondary);border:1px solid var(--accent-4);color:var(--accent-4);
+  font-size:13px;font-weight:500;z-index:1000;animation:toastIn 0.3s ease;
+  box-shadow:0 10px 40px rgba(0,0,0,0.3);
+}
+.toast.error{border-color:#ef4444;color:#ef4444}
+@keyframes toastIn{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
 </style>
 </head>
 <body>
-<div class="container">
-<h1>🤖 دستیار روبیکا</h1>
-<div class="stats">
-  <div class="stat"><div class="num" id="st-kb">0</div><div class="label">دانش</div></div>
-  <div class="stat"><div class="num" id="st-pen">0</div><div class="label">در انتظار</div></div>
-  <div class="stat"><div class="num" id="st-log">0</div><div class="label">لاگ امروز</div></div>
+<div class="app">
+  <!-- ───── Sidebar ───── -->
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <h1><i class="fas fa-robot"></i> روبیکا</h1>
+      <p>پنل مدیریت هوشمند</p>
+    </div>
+    <nav class="nav">
+      <div class="nav-item active" data-tab="dashboard"><i class="fas fa-th-large"></i>داشبورد</div>
+      <div class="nav-item" data-tab="chat"><i class="fas fa-comments"></i>چت با AI</div>
+      <div class="nav-item" data-tab="send"><i class="fas fa-paper-plane"></i>ارسال پیام</div>
+      <div class="nav-item" data-tab="kb"><i class="fas fa-brain"></i>دانش</div>
+      <div class="nav-item" data-tab="pending"><i class="fas fa-clock"></i>سوالات</div>
+      <div class="nav-item" data-tab="logs"><i class="fas fa-list-alt"></i>لاگ</div>
+      <div class="nav-item" data-tab="config"><i class="fas fa-cog"></i>تنظیمات</div>
+    </nav>
+    <div class="sidebar-footer">
+      <span class="status-dot"></span>
+      <span style="font-size:12px;color:var(--text-secondary)">سیستم فعال</span>
+    </div>
+  </aside>
+
+  <!-- ───── Main Content ───── -->
+  <main class="main">
+    <div class="header">
+      <h2 id="page-title">داشبورد</h2>
+      <div class="header-actions">
+        <button class="header-btn" onclick="updateStats()"><i class="fas fa-sync-alt"></i> بروزرسانی</button>
+        <button class="header-btn" onclick="window.open('/api/health','_blank')"><i class="fas fa-heartbeat"></i> سلامت</button>
+      </div>
+    </div>
+
+    <!-- ───── Dashboard Panel ───── -->
+    <div id="panel-dashboard" class="panel active">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-icon"><i class="fas fa-brain"></i></div>
+          <div class="stat-value" id="st-kb">0</div>
+          <div class="stat-label">دانش ثبت شده</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon"><i class="fas fa-hourglass-half"></i></div>
+          <div class="stat-value" id="st-pen">0</div>
+          <div class="stat-label">در انتظار پاسخ</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon"><i class="fas fa-calendar-day"></i></div>
+          <div class="stat-value" id="st-log">0</div>
+          <div class="stat-label">لاگ امروز</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon"><i class="fas fa-key"></i></div>
+          <div class="stat-value" id="st-keys">-</div>
+          <div class="stat-label">کلیدهای API</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="fas fa-info-circle"></i> راهنمای سریع</div>
+        </div>
+        <div class="guide-box">
+          <h4><i class="fas fa-lightbulb"></i> نکات مهم</h4>
+          <p>
+            • برای فعال‌سازی چرخش کلیدها، کلیدها رو با کاما در GEMINI_API_KEY جدا کنید<br>
+            • از تب دانش برای مدیریت سوالات و جواب‌های متداول استفاده کنید<br>
+            • سوالات pending در گروه کنترل نمایش داده میشن<br>
+            • لاگ‌ها هر ۵ ثانیه بروزرسانی میشن
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───── Chat Panel ───── -->
+    <div id="panel-chat" class="panel">
+      <div class="card">
+        <div class="chat-container">
+          <div class="chat-messages" id="chat-box"></div>
+          <div class="chat-input-wrap">
+            <input type="text" class="chat-input" id="chat-in" placeholder="پیامت رو بنویس...">
+            <button class="send-btn" id="btn-chat-send"><i class="fas fa-paper-plane"></i> ارسال</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───── Send Panel ───── -->
+    <div id="panel-send" class="panel">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="fas fa-paper-plane"></i> ارسال پیام</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">GUID چت</label>
+          <input type="text" class="form-input" id="s-guid" placeholder="GUID چت مورد نظر">
+        </div>
+        <div class="form-group">
+          <label class="form-label">متن پیام</label>
+          <textarea class="form-textarea" id="s-text" placeholder="متن پیام رو بنویس..."></textarea>
+        </div>
+        <button class="btn btn-primary" id="btn-send-msg"><i class="fas fa-paper-plane"></i> ارسال</button>
+        <div id="send-status" style="margin-top:12px;font-size:13px"></div>
+      </div>
+    </div>
+
+    <!-- ───── KB Panel ───── -->
+    <div id="panel-kb" class="panel">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="fas fa-plus-circle"></i> افزودن دانش جدید</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">سوال</label>
+          <input type="text" class="form-input" id="k-q" placeholder="سوال رو بنویس...">
+        </div>
+        <div class="form-group">
+          <label class="form-label">جواب</label>
+          <textarea class="form-textarea" id="k-a" placeholder="جواب رو بنویس..."></textarea>
+        </div>
+        <button class="btn btn-success" id="btn-add-kb"><i class="fas fa-save"></i> ذخیره</button>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="fas fa-database"></i> دانش ثبت شده</div>
+        </div>
+        <div class="item-list" id="kb-list"></div>
+      </div>
+    </div>
+
+    <!-- ───── Pending Panel ───── -->
+    <div id="panel-pending" class="panel">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="fas fa-hourglass-half"></i> سوالات در انتظار</div>
+        </div>
+        <div id="pending-list"></div>
+      </div>
+    </div>
+
+    <!-- ───── Logs Panel ───── -->
+    <div id="panel-logs" class="panel">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="fas fa-list-alt"></i> آخرین لاگ‌ها</div>
+        </div>
+        <div id="logs-list"></div>
+      </div>
+    </div>
+
+    <!-- ───── Config Panel ───── -->
+    <div id="panel-config" class="panel">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="fas fa-cog"></i> وضعیت سیستم</div>
+        </div>
+        <div id="config-info"></div>
+      </div>
+    </div>
+  </main>
 </div>
-<div class="tabs">
-  <button type="button" class="tab active" data-tab="chat">💬 چت با AI</button>
-  <button type="button" class="tab" data-tab="send">📨 ارسال پیام</button>
-  <button type="button" class="tab" data-tab="kb">📚 دانش</button>
-  <button type="button" class="tab" data-tab="pending">⏳ سوالات</button>
-  <button type="button" class="tab" data-tab="logs">📋 لاگ</button>
-  <button type="button" class="tab" data-tab="config">⚙️ تنظیمات</button>
-</div>
-<div id="panel-chat" class="panel active">
-  <div class="msg-box" id="chat-box"></div>
-  <div style="display:flex;gap:8px">
-    <input type="text" id="chat-in" placeholder="پیامت رو بنویس..." style="flex:1;margin:0">
-    <button type="button" id="btn-chat-send">ارسال</button>
-  </div>
-</div>
-<div id="panel-send" class="panel">
-  <input type="text" id="s-guid" placeholder="GUID چت">
-  <textarea id="s-text" placeholder="متن پیام"></textarea>
-  <button type="button" id="btn-send-msg">📤 ارسال</button>
-  <div id="send-status" class="small" style="margin-top:8px"></div>
-</div>
-<div id="panel-kb" class="panel">
-  <input type="text" id="k-q" placeholder="سوال">
-  <textarea id="k-a" placeholder="جواب"></textarea>
-  <button type="button" id="btn-add-kb">➕ ذخیره</button>
-  <hr>
-  <div id="kb-list"></div>
-</div>
-<div id="panel-pending" class="panel">
-  <div id="pending-list"></div>
-</div>
-<div id="panel-logs" class="panel">
-  <div id="logs-list"></div>
-</div>
-<div id="panel-config" class="panel">
-  <div id="config-info"></div>
-</div>
-</div>
+
 <script>
+// ───── Utilities ─────
 function esc(t){const d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
+function showToast(msg,isError){
+  const t=document.createElement('div');t.className='toast'+(isError?' error':'');t.textContent=msg;
+  document.body.appendChild(t);setTimeout(()=>t.remove(),3000);
+}
+
+// ───── Tab Switching ─────
+const titles={dashboard:'داشبورد',chat:'چت با AI',send:'ارسال پیام',kb:'مدیریت دانش',pending:'سوالات',logs:'لاگ',config:'تنظیمات'};
 function switchTab(name){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
   document.querySelector('[data-tab="'+name+'"]').classList.add('active');
+  document.getElementById('page-title').textContent=titles[name]||name;
   if(name==='kb') loadKB();
   if(name==='pending') loadPending();
   if(name==='logs') loadLogs();
   if(name==='config') loadConfig();
 }
-document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
+document.querySelectorAll('.nav-item').forEach(n=>n.onclick=()=>switchTab(n.dataset.tab));
+
+// ───── Chat ─────
 async function sendChat(){
   const inp=document.getElementById('chat-in');
-  const t=inp.value.trim(); if(!t) return;
+  const t=inp.value.trim();if(!t)return;
   inp.value='';
   const box=document.getElementById('chat-box');
-  box.innerHTML+='<div class="msg msg-u">👤 <b>تو:</b> '+esc(t)+'</div>';
+  box.innerHTML+='<div class="msg msg-user"><div>'+esc(t)+'</div><div class="msg-meta"><i class="fas fa-user"></i> تو</div></div>';
+  box.scrollTop=box.scrollHeight;
+  const loading=document.createElement('div');loading.className='msg msg-ai';loading.id='loading-msg';
+  loading.innerHTML='<div class="spinner"></div><div class="msg-meta"><i class="fas fa-robot"></i> در حال پردازش...</div>';
+  box.appendChild(loading);box.scrollTop=box.scrollHeight;
   try{
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:t})});
     const d=await r.json();
-    box.innerHTML+='<div class="msg msg-a">🤖 <b>AI:</b> '+esc(d.reply||d.error||'خطا')+'</div>';
+    document.getElementById('loading-msg')?.remove();
+    box.innerHTML+='<div class="msg msg-ai"><div>'+esc(d.reply||d.error||'خطا')+'</div><div class="msg-meta"><i class="fas fa-robot"></i> AI</div></div>';
     box.scrollTop=box.scrollHeight;
   }catch(e){
-    box.innerHTML+='<div class="msg msg-a">❌ خطا</div>';
+    document.getElementById('loading-msg')?.remove();
+    box.innerHTML+='<div class="msg msg-ai"><div>خطای شبکه</div><div class="msg-meta"><i class="fas fa-robot"></i> AI</div></div>';
   }
 }
 document.getElementById('btn-chat-send').onclick=sendChat;
 document.getElementById('chat-in').onkeydown=e=>{if(e.key==='Enter')sendChat();};
+
+// ───── Send Message ─────
 async function sendMsg(){
   const g=document.getElementById('s-guid').value.trim();
   const t=document.getElementById('s-text').value.trim();
   const st=document.getElementById('send-status');
-  if(!g||!t){st.textContent='⚠️ GUID و متن رو پر کن!';return;}
-  st.textContent='⏳ در حال ارسال...';
+  if(!g||!t){st.innerHTML='<span style="color:#ef4444">GUID و متن رو پر کن!</span>';return;}
+  st.innerHTML='<span class="spinner"></span> در حال ارسال...';
   try{
     const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guid:g,text:t})});
     const d=await r.json();
-    st.textContent=d.ok?'✅ ارسال شد!':'❌ '+(d.error||'خطا');
-    if(d.ok){document.getElementById('s-guid').value='';document.getElementById('s-text').value='';}
-  }catch(e){st.textContent='❌ خطای شبکه';}
+    if(d.ok){
+      st.innerHTML='<span style="color:var(--accent-4)">ارسال شد!</span>';
+      document.getElementById('s-guid').value='';document.getElementById('s-text').value='';
+      showToast('پیام با موفقیت ارسال شد');
+    }else{
+      st.innerHTML='<span style="color:#ef4444">'+esc(d.error||'خطا')+'</span>';
+    }
+  }catch(e){st.innerHTML='<span style="color:#ef4444">خطای شبکه</span>';}
 }
 document.getElementById('btn-send-msg').onclick=sendMsg;
+
+// ───── Knowledge Base ─────
 async function addKB(){
   const q=document.getElementById('k-q').value.trim();
   const a=document.getElementById('k-a').value.trim();
-  if(!q||!a) return;
+  if(!q||!a)return;
   try{
     await fetch('/api/kb',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q:q,a:a})});
     document.getElementById('k-q').value='';document.getElementById('k-a').value='';
-    loadKB(); updateStats();
+    loadKB();updateStats();showToast('دانش ذخیره شد');
   }catch(e){}
 }
 document.getElementById('btn-add-kb').onclick=addKB;
 async function delKB(q){
-  try{await fetch('/api/kb/'+encodeURIComponent(q),{method:'DELETE'});loadKB();updateStats();}catch(e){}
+  try{await fetch('/api/kb/'+encodeURIComponent(q),{method:'DELETE'});loadKB();updateStats();showToast('حذف شد');}catch(e){}
 }
 async function loadKB(){
   const list=document.getElementById('kb-list');
   try{
-    const r=await fetch('/api/kb');
-    const items=(await r.json()).kb||{};
-    list.innerHTML='';
+    const r=await fetch('/api/kb');const items=(await r.json()).kb||{};list.innerHTML='';
     const entries=Object.entries(items);
-    if(entries.length===0){list.innerHTML='<div class="empty">دانشی ثبت نشده</div>';return;}
+    if(entries.length===0){list.innerHTML='<div class="empty-state"><i class="fas fa-database"></i><p>دانشی ثبت نشده</p></div>';return;}
     for(const [q,a] of entries){
-      const div=document.createElement('div');div.className='kb-item';
-      div.innerHTML='<div><b class="small">❓</b> '+esc(q)+'<br><b class="small">💡</b> '+esc(a)+'</div>';
-      const btn=document.createElement('button');btn.textContent='🗑';btn.className='btn-red';
-      btn.onclick=()=>delKB(q);
+      const div=document.createElement('div');div.className='item-card';
+      div.innerHTML='<div class="item-content"><b>'+esc(q)+'</b><p>'+esc(a)+'</p></div>';
+      const btn=document.createElement('button');btn.className='btn btn-danger btn-sm';
+      btn.innerHTML='<i class="fas fa-trash"></i>';btn.onclick=()=>delKB(q);
       div.appendChild(btn);list.appendChild(div);
     }
   }catch(e){}
 }
+
+// ───── Pending ─────
 async function loadPending(){
   const list=document.getElementById('pending-list');
   try{
-    const r=await fetch('/api/pending');
-    const items=(await r.json()).pending||{};
-    list.innerHTML='';
+    const r=await fetch('/api/pending');const items=(await r.json()).pending||{};list.innerHTML='';
     const entries=Object.entries(items);
-    if(entries.length===0){list.innerHTML='<div class="empty">سوالی در انتظار نیست</div>';return;}
+    if(entries.length===0){list.innerHTML='<div class="empty-state"><i class="fas fa-check-circle"></i><p>سوالی در انتظار نیست</p></div>';return;}
     for(const [id,info] of entries){
-      const div=document.createElement('div');div.className='pending-item';
-      div.innerHTML='<div><b>#'+id+'</b> <span class="small">'+esc(info.chat_guid)+'</span><br>'+esc(info.user_text)+'</div>';
-      list.appendChild(div);
-      const row=document.createElement('div');row.className='pending-row';
-      const inp=document.createElement('input');inp.type='text';inp.placeholder='جوابت رو بنویس...';
+      const div=document.createElement('div');div.className='pending-card';
+      div.innerHTML='<div class="pending-header"><span class="pending-id">#'+id+'</span><span class="pending-time">'+esc(info.time||'')+'</span></div><div class="pending-text">'+esc(info.user_text)+'</div>';
+      const row=document.createElement('div');row.className='pending-input-wrap';
+      const inp=document.createElement('input');inp.type='text';inp.className='pending-input';inp.placeholder='جوابت رو بنویس...';
       inp.onkeydown=e=>{if(e.key==='Enter')ansPen(id,inp.value);};
-      const btn=document.createElement('button');btn.textContent='✅';
-      btn.onclick=()=>ansPen(id,inp.value);
-      row.appendChild(inp);row.appendChild(btn);list.appendChild(row);
+      const btn=document.createElement('button');btn.className='btn btn-success btn-sm';
+      btn.innerHTML='<i class="fas fa-check"></i>';btn.onclick=()=>ansPen(id,inp.value);
+      row.appendChild(inp);row.appendChild(btn);div.appendChild(row);list.appendChild(div);
     }
   }catch(e){}
 }
 async function ansPen(id,text){
-  if(!text.trim()) return;
+  if(!text.trim())return;
   try{
     const r=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,text:text.trim()})});
     const d=await r.json();
-    if(d.ok){loadPending();updateStats();}
+    if(d.ok){loadPending();updateStats();showToast('پاسخ ارسال شد');}
   }catch(e){}
 }
+
+// ───── Logs ─────
 async function loadLogs(){
   const list=document.getElementById('logs-list');
   try{
-    const r=await fetch('/api/logs');
-    const logs=(await r.json()).logs||[];
-    list.innerHTML='';
-    if(logs.length===0){list.innerHTML='<div class="empty">لاگ خالیه</div>';return;}
+    const r=await fetch('/api/logs');const logs=(await r.json()).logs||[];list.innerHTML='';
+    if(logs.length===0){list.innerHTML='<div class="empty-state"><i class="fas fa-inbox"></i><p>لاگ خالیه</p></div>';return;}
     for(const log of logs.reverse()){
-      const div=document.createElement('div');div.className='msg msg-u';
-      div.innerHTML='<span class="small">'+esc(log.time)+' | '+esc(log.guid)+'</span><br><b>'+esc(log.from)+':</b> '+esc(log.text);
+      const div=document.createElement('div');div.className='log-item';
+      div.innerHTML='<div><span class="log-time">'+esc(log.time)+'</span><span class="log-guid">'+esc(log.guid)+'</span><span class="log-from">'+esc(log.from)+'</span></div><div class="log-text">'+esc(log.text)+'</div>';
       list.appendChild(div);
     }
   }catch(e){}
 }
+
+// ───── Config ─────
 async function loadConfig(){
   const el=document.getElementById('config-info');
   try{
-    const r=await fetch('/api/config');
-    const d=await r.json();
-    const env=d.env||{};
-    let html='<h3 style="color:#58a6ff;margin-bottom:10px">⚙️ وضعیت متغیرهای محیطی</h3>';
-    html+='<table style="width:100%;font-size:13px;border-collapse:collapse">';
+    const r=await fetch('/api/config');const d=await r.json();const env=d.env||{};
     const items=[
       ['GEMINI_API_KEY','کلیدهای Gemini API'],
       ['SESSION_B64_PART1','سشن روبیکا (پارت ۱)'],
@@ -560,33 +973,35 @@ async function loadConfig(){
       ['OWNER_CONTROL_GROUP','گروه کنترل'],
       ['RUBIKA_PHONE','شماره تلفن'],
     ];
+    let html='<table class="config-table"><thead><tr><th>متغیر</th><th>وضعیت</th></tr></thead><tbody>';
     for(const [k,label] of items){
       const ok=env[k];
-      html+='<tr style="border-bottom:1px solid #30363d"><td style="padding:8px">'+label+'</td>';
-      html+='<td style="padding:8px;text-align:left"><span class="'+(ok?'env-ok':'env-miss')+'">'+(ok?'✅ تنظیم شده':'❌ تنظیم نشده')+'</span></td></tr>';
+      html+='<tr><td>'+label+'</td><td><span class="config-badge '+(ok?'ok':'error')+'"><i class="fas '+(ok?'fa-check-circle':'fa-times-circle')+'"></i>'+(ok?'تنظیم شده':'تنظیم نشده')+'</span></td></tr>';
     }
-    html+='</table>';
-    html+='<div style="margin-top:12px;padding:10px;background:#0d1117;border-radius:6px;font-size:12px;color:#8b949e">';
-    html+='<b style="color:#e3b341">📝 راهنما:</b><br>';
-    html+='کلیدهای API خود را در GEMINI_API_KEY با کاما جدا کنید تا چرخش خودکار فعال شود.<br>';
-    html+='</div>';
+    html+='</tbody></table>';
+    html+='<div class="guide-box"><h4><i class="fas fa-lightbulb"></i> راهنما</h4><p>کلیدهای API خود را در GEMINI_API_KEY با کاما جدا کنید تا چرخش خودکار فعال شود.</p></div>';
     el.innerHTML=html;
-  }catch(e){el.innerHTML='<div class="empty">خطا</div>';}
+  }catch(e){el.innerHTML='<div class="empty-state"><i class="fas fa-exclamation-triangle"></i><p>خطا در بارگذاری</p></div>';}
 }
+
+// ───── Stats ─────
 async function updateStats(){
   try{
-    const r=await fetch('/api/stats');
-    const d=await r.json();
+    const r=await fetch('/api/stats');const d=await r.json();
     document.getElementById('st-kb').textContent=d.kb;
     document.getElementById('st-pen').textContent=d.pen;
     document.getElementById('st-log').textContent=d.today;
   }catch(e){}
+  try{
+    const r=await fetch('/api/config');const d=await r.json();
+    document.getElementById('st-keys').textContent=d.env?.GEMINI_API_KEY?'فعال':'غیرفعال';
+  }catch(e){}
 }
-updateStats();
-setInterval(updateStats,5000);
+updateStats();setInterval(updateStats,5000);
 </script>
 </body>
 </html>
+
 """
 
 
