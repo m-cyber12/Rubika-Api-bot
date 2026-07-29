@@ -47,7 +47,15 @@ from datetime import datetime
 from collections import OrderedDict
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlparse
+from urllib.parse import (
+    parse_qs,
+    parse_qsl,
+    quote_plus,
+    unquote,
+    urlencode,
+    urlparse,
+    urlunparse,
+)
 from urllib.request import Request, urlopen
 
 from rubpy import Client
@@ -77,14 +85,20 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 # ──────────────── تنظیمات ─────────────────
 def _csv_env(name):
-    """CSV انعطاف‌پذیر: کوتیشن، براکت، و OWNER_GUIDS= داخل value را اصلاح می‌کند."""
-    raw = os.environ.get(name, "")
+    """CSV انعطاف‌پذیر: کوتیشن، براکت، و NAME= داخل value را اصلاح می‌کند."""
+    raw = os.environ.get(name, "").strip()
+    prefix = name + "="
+    if raw.casefold().startswith(prefix.casefold()):
+        raw = raw.split("=", 1)[1].strip()
+    raw = raw.strip("[](){} \t\r\n")
     raw = raw.replace("،", ",").replace(";", ",").replace("\n", ",")
+
     values = []
     for item in raw.split(","):
         clean = item.strip().strip("[](){} \t\r\n'\"")
-        if clean.casefold().startswith((name + "=").casefold()):
-            clean = clean.split("=", 1)[1].strip().strip("'\"")
+        if clean.casefold().startswith(prefix.casefold()):
+            clean = clean.split("=", 1)[1].strip()
+            clean = clean.strip("[](){} \t\r\n'\"")
         if clean:
             values.append(clean)
     return frozenset(values)
@@ -290,6 +304,24 @@ class _DuckDuckGoHTMLParser(HTMLParser):
             self._buffer = []
 
 
+def _clean_public_url(raw_url):
+    """پارامترهای تبلیغاتی را حذف می‌کند، اما پارامترهای کاربردی لینک را نگه می‌دارد."""
+    value = str(raw_url or "").strip()
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    blocked_names = {"fbclid", "gclid", "ref", "ref_src"}
+    clean_query = []
+    for key, item_value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.casefold()
+        if lowered.startswith(("utm_", "at_")) or lowered in blocked_names:
+            continue
+        clean_query.append((key, item_value))
+    return urlunparse(
+        parsed._replace(query=urlencode(clean_query, doseq=True))
+    )[:1200]
+
+
 def _normalise_search_url(raw_url):
     value = (raw_url or "").strip()
     if value.startswith("//"):
@@ -298,10 +330,7 @@ def _normalise_search_url(raw_url):
     if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
         target = parse_qs(parsed.query).get("uddg", [""])[0]
         value = unquote(target)
-        parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"}:
-        return ""
-    return value[:1000]
+    return _clean_public_url(value)
 
 
 def _post_json(url, payload, headers=None, timeout=WEB_SEARCH_TIMEOUT_SECONDS):
@@ -353,7 +382,7 @@ def _grounding_sources(payload):
             if not isinstance(chunk, dict):
                 continue
             web = chunk.get("web") or {}
-            uri = str(web.get("uri") or "").strip()
+            uri = _clean_public_url(web.get("uri"))
             title = str(web.get("title") or "").strip()
             if not uri or uri in seen or not uri.startswith(("http://", "https://")):
                 continue
@@ -478,7 +507,7 @@ def _tavily_search(query):
         for item in data.get("results", []):
             if not isinstance(item, dict):
                 continue
-            url = str(item.get("url") or "").strip()
+            url = _clean_public_url(item.get("url"))
             if not url.startswith(("http://", "https://")):
                 continue
             results.append({
@@ -518,6 +547,15 @@ _KNOWN_NEWS_FEEDS = (
     ),
 )
 
+_KNOWN_NEWS_SITEMAPS = (
+    (
+        ("iran international", "iranintl", "ایران اینترنشنال", "ایران‌اینترنشنال"),
+        "ایران اینترنشنال",
+        "https://www.iranintl.com/sitemap-news.xml",
+        "fa",
+    ),
+)
+
 
 def _requested_result_count(query, default=3):
     value = str(query or "").casefold().translate(
@@ -539,7 +577,7 @@ def _rss_items(body, limit):
     seen = set()
     for item in root.findall(".//item"):
         title = " ".join((item.findtext("title") or "").split())
-        link = (item.findtext("link") or "").strip()
+        link = _clean_public_url(item.findtext("link"))
         published = " ".join((item.findtext("pubDate") or "").split())
         description = item.findtext("description") or ""
         description = html_lib.unescape(re.sub(r"<[^>]+>", " ", description))
@@ -600,6 +638,86 @@ def _known_site_feed_search(query):
         return None
 
 
+def _xml_local_name(tag):
+    return str(tag).rsplit("}", 1)[-1]
+
+
+def _news_sitemap_items(body, language, limit):
+    root = ET.fromstring(body)
+    candidates = []
+    seen = set()
+    for url_node in root.iter():
+        if _xml_local_name(url_node.tag) != "url":
+            continue
+        values = {}
+        for child in url_node.iter():
+            name = _xml_local_name(child.tag)
+            text = " ".join((child.text or "").split())
+            if text and name in {"loc", "language", "publication_date", "title"}:
+                values[name] = text
+        link = _clean_public_url(values.get("loc"))
+        title = values.get("title", "")
+        item_language = values.get("language", "")
+        published = values.get("publication_date", "")
+        if item_language != language or not title or not link or link in seen:
+            continue
+        seen.add(link)
+        candidates.append({
+            "title": title[:300],
+            "snippet": "",
+            "published": published[:100],
+            "url": link,
+        })
+    candidates.sort(key=lambda item: item.get("published", ""), reverse=True)
+    return candidates[:limit]
+
+
+def _known_site_sitemap_search(query):
+    """خبرهای تازهٔ سایت‌هایی که RSS ندارند را از Google News Sitemap رسمی می‌گیرد."""
+    value = " ".join(str(query or "").casefold().split())
+    selected = None
+    for aliases, source_name, sitemap_url, language in _KNOWN_NEWS_SITEMAPS:
+        if any(alias in value for alias in aliases):
+            selected = (source_name, sitemap_url, language)
+            break
+    if not selected:
+        return None
+
+    source_name, sitemap_url, language = selected
+    count = _requested_result_count(query)
+    req = Request(
+        sitemap_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; RubikaSafeAgent/2.5)",
+            "Accept": "application/xml,text/xml",
+        },
+    )
+    try:
+        with urlopen(req, timeout=WEB_SEARCH_TIMEOUT_SECONDS) as response:
+            body = response.read(3_000_000)
+        results = _news_sitemap_items(body, language, count)
+        if not results:
+            return None
+        answer_lines = [f"{len(results)} خبر تازه از {source_name}:"]
+        for index, item in enumerate(results, 1):
+            answer_lines.append(f"{index}. {item['title']}")
+        return json.dumps(
+            {
+                "provider": "official_news_sitemap",
+                "answer": "\n".join(answer_lines),
+                "sources": results,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        log.info(
+            "SEARCH official sitemap failed for %s: %s",
+            source_name,
+            type(exc).__name__,
+        )
+        return None
+
+
 def _is_news_query(query):
     lowered = str(query).casefold()
     markers = (
@@ -633,7 +751,7 @@ def _google_news_search(query):
         seen = set()
         for item in root.findall(".//item"):
             title = " ".join((item.findtext("title") or "").split())
-            link = (item.findtext("link") or "").strip()
+            link = _clean_public_url(item.findtext("link"))
             published = " ".join((item.findtext("pubDate") or "").split())
             description = item.findtext("description") or ""
             description = html_lib.unescape(re.sub(r"<[^>]+>", " ", description))
@@ -748,6 +866,7 @@ def search_web(query: str) -> str:
 
     providers = [
         ("official_rss", _known_site_feed_search),
+        ("official_news_sitemap", _known_site_sitemap_search),
         ("tavily", _tavily_search),
         ("google_news_rss", _google_news_search),
         ("gemini_google_search", _gemini_google_search),
@@ -840,7 +959,7 @@ def _format_direct_search_result(raw_result):
         lines.extend(["", "🔗 منابع برای بررسی:"])
         for index, item in enumerate(valid_sources[:3], 1):
             title = " ".join(str(item.get("title") or "منبع").split())[:180]
-            url = str(item.get("url") or "").strip()[:700]
+            url = _clean_public_url(item.get("url"))[:700]
             lines.append(f"{index}. {title}")
             if url.startswith(("http://", "https://")):
                 lines.append(url)
@@ -2022,7 +2141,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase1-agent-v2.4-rss-loop-fix",
+        "version": "phase1-agent-v2.5-stage1-final",
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -2231,6 +2350,7 @@ def api_config():
             "tools": [func.__name__ for func in AGENT_TOOLS],
             "search_providers": {
                 "official_rss": True,
+                "official_news_sitemap": True,
                 "tavily": bool(TAVILY_API_KEY),
                 "google_news_rss": True,
                 "gemini_google_search": bool(GEMINI_API_KEYS),
