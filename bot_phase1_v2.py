@@ -670,6 +670,70 @@ def search_web(query: str) -> str:
     return result
 
 
+def is_direct_web_request(text):
+    """درخواست‌های واضحِ نیازمند اینترنت را بدون دور دوم LLM تشخیص می‌دهد."""
+    value = " ".join(str(text or "").casefold().split())
+    markers = (
+        "جستجو", "جست‌وجو", "سرچ", "در وب", "اینترنت",
+        "آخرین خبر", "آخرین اخبار", "خبر سایت", "خبرهای",
+        "اخبار امروز", "قیمت امروز", "آب و هوا", "وضعیت هوا",
+        "search the web", "web search", "latest news", "breaking news",
+        "current price", "weather today",
+    )
+    return any(marker in value for marker in markers)
+
+
+def _format_direct_search_result(raw_result):
+    """نتیجهٔ ابزار را بدون نیاز به یک درخواست دیگر Gemini قابل‌ارسال می‌کند."""
+    try:
+        payload = json.loads(raw_result)
+    except (TypeError, json.JSONDecodeError):
+        return str(raw_result or "نتیجه‌ای پیدا نشد.")[:3900]
+
+    if not isinstance(payload, dict):
+        return str(raw_result)[:3900]
+
+    provider = str(payload.get("provider") or "web")
+    answer = str(payload.get("answer") or "").strip()
+    sources = payload.get("sources") or []
+    lines = ["🔎 نتیجه جست‌وجو"]
+    if answer and answer != "نتایج خبری تازه به ترتیب فید Google News":
+        lines.extend(["", answer[:1800]])
+
+    valid_sources = [item for item in sources if isinstance(item, dict)][:5]
+    if valid_sources:
+        lines.extend(["", "منابع:"])
+        for index, item in enumerate(valid_sources, 1):
+            title = " ".join(str(item.get("title") or "منبع").split())[:220]
+            published = " ".join(str(item.get("published") or "").split())[:80]
+            url = str(item.get("url") or "").strip()[:700]
+            line = f"{index}. {title}"
+            if published:
+                line += f" — {published}"
+            lines.append(line)
+            if url.startswith(("http://", "https://")):
+                lines.append(url)
+
+    if not answer and not valid_sources:
+        return "متأسفانه هیچ منبع اینترنتی قابل‌استفاده‌ای پیدا نشد."
+    lines.append(f"\nموتور: {provider}")
+    return "\n".join(lines)[:3900]
+
+
+def execute_direct_web_search(query, actor):
+    _agent_context.actor = actor
+    _agent_context.user_prompt = str(query)[:5000]
+    _agent_context.search_result = None
+    try:
+        return _format_direct_search_result(search_web(query))
+    finally:
+        for field in ("actor", "user_prompt", "search_result"):
+            try:
+                delattr(_agent_context, field)
+            except AttributeError:
+                pass
+
+
 _SENSITIVE_WORDS = {
     "password", "passwd", "secret", "token", "cookie", "api_key", "apikey",
     "رمز", "پسورد", "توکن", "کلید api", "کلید_api",
@@ -1828,7 +1892,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase1-agent-v2.1-fast",
+        "version": "phase1-agent-v2.2-direct-search",
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -1847,15 +1911,24 @@ def api_stats():
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
-    if not agent_model:
-        return jsonify({"error": "GEMINI_API_KEY تنظیم نشده – Agent غیرفعاله."}), 503
-
     data = request.get_json(silent=True) or {}
     msg = (data.get("msg") or "").strip()
     if not msg:
         return jsonify({"error": "Empty"}), 400
     if len(msg) > 4000:
         return jsonify({"error": "Message is too long"}), 413
+
+    actor = f"dashboard:{request.remote_addr or 'unknown'}"
+    if is_direct_web_request(msg):
+        try:
+            reply = execute_direct_web_search(msg, actor=actor)
+            return jsonify({"reply": reply, "mode": "direct_web_search"})
+        except Exception as exc:
+            log.error("DIRECT SEARCH ERROR: %s", exc, exc_info=True)
+            return jsonify({"error": "Web search temporarily unavailable"}), 502
+
+    if not agent_model:
+        return jsonify({"error": "GEMINI_API_KEY تنظیم نشده – Agent غیرفعاله."}), 503
 
     try:
         with _lock_kb:
@@ -1866,7 +1939,6 @@ def api_chat():
                 f"- {q}: {a}" for q, a in kb_items
             )
 
-        actor = f"dashboard:{request.remote_addr or 'unknown'}"
         res = execute_agent_with_rotation_sync(
             "dashboard", msg + kb_ctx, actor=actor
         )
@@ -2383,6 +2455,30 @@ async def handle_messages(update: Updates):
                 log.info("NEW  تاریخچه چت%s ریست شد", " Agent" if owner_authorized else "")
 
     log.info(f"MSG  {chat_guid} | {user_text[:50]}")
+
+    # درخواست اینترنتی مالک مستقیماً اجرا می‌شود؛ بدون دور دوم Gemini و بدون Pending.
+    if owner_authorized and is_direct_web_request(user_text):
+        try:
+            direct_reply = await asyncio.to_thread(
+                execute_direct_web_search,
+                user_text,
+                f"rubika:{author_guid or chat_guid}",
+            )
+            sent = await update.reply(direct_reply)
+            sid = _extract_msg_id(sent)
+            if sid is not None:
+                with _lock_sent:
+                    bot_sent_message_ids.add(sid)
+                    _trim_bot_sent_ids()
+                save_bot_sent()
+            log.info("DIRECT_SEARCH sent chat=%s", _mask_guid(chat_guid))
+        except Exception as exc:
+            log.error("DIRECT SEARCH RUBIKA ERROR: %s", exc, exc_info=True)
+            try:
+                await update.reply("متأسفانه جست‌وجوی وب موقتاً در دسترس نیست.")
+            except Exception:
+                pass
+        return
 
     # ──── پاسخ از دانش ────
     with _lock_kb:
