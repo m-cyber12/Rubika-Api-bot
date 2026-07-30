@@ -1940,6 +1940,36 @@ def _voice_update_metadata(update):
     return size, mime, filename
 
 
+def _should_reply_with_voice(text, input_is_voice=False):
+    value = " ".join(str(text or "").casefold().split())
+    negative_markers = (
+        "فقط متن",
+        "متنی جواب بده",
+        "ویس نفرست",
+        "صوتی نفرست",
+        "بدون ویس",
+        "بدون صدا",
+    )
+    if any(marker in value for marker in negative_markers):
+        return False
+    if input_is_voice:
+        return True
+    positive_markers = (
+        "با ویس جواب بده",
+        "با ویس بگو",
+        "ویس بفرست",
+        "ویس جواب بده",
+        "صوتی جواب بده",
+        "پاسخ صوتی",
+        "با صدا جواب بده",
+        "برام بخون",
+        "رو بخون",
+        "را بخون",
+        "بلند بخون",
+    )
+    return any(marker in value for marker in positive_markers)
+
+
 async def _reply_text_and_voice(update, text, with_voice=False):
     sent = await update.reply(text)
     if not with_voice:
@@ -3406,7 +3436,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase3-voice-v1.0",
+        "version": "phase3-voice-v1.1-text-trigger",
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -4033,6 +4063,10 @@ async def handle_messages(update: Updates):
     if not user_text:
         return
 
+    voice_reply_requested = _should_reply_with_voice(
+        user_text, input_is_voice=voice_input
+    )
+
     log.info(
         "ROUTE owner=%s chat=%s author=%s configured=%s",
         owner_authorized,
@@ -4179,7 +4213,7 @@ async def handle_messages(update: Updates):
         )
         try:
             sent = await _reply_text_and_voice(
-                update, reply_text, with_voice=voice_input
+                update, reply_text, with_voice=voice_reply_requested
             )
             sid = _extract_msg_id(sent)
             if sid is not None:
@@ -4200,7 +4234,7 @@ async def handle_messages(update: Updates):
                 f"rubika:{author_guid or chat_guid}",
             )
             sent = await _reply_text_and_voice(
-                update, direct_reply, with_voice=voice_input
+                update, direct_reply, with_voice=voice_reply_requested
             )
             sid = _extract_msg_id(sent)
             if sid is not None:
@@ -4225,7 +4259,7 @@ async def handle_messages(update: Updates):
         try:
             await asyncio.sleep(random.uniform(REPLY_DELAY_MIN, REPLY_DELAY_MAX))
             sent = await _reply_text_and_voice(
-                update, kb_answer, with_voice=voice_input
+                update, kb_answer, with_voice=voice_reply_requested
             )
             sid = _extract_msg_id(sent)
             if sid is not None:
@@ -4323,7 +4357,7 @@ async def handle_messages(update: Updates):
 
             try:
                 sent = await _reply_text_and_voice(
-                    update, ai_text, with_voice=voice_input
+                    update, ai_text, with_voice=voice_reply_requested
                 )
                 sid = _extract_msg_id(sent)
                 if sid is not None:
@@ -4336,7 +4370,7 @@ async def handle_messages(update: Updates):
                 log.error(f"REPLY ERROR: {e}")
         else:
             sent = await _reply_text_and_voice(
-                update, ai_text, with_voice=voice_input
+                update, ai_text, with_voice=voice_reply_requested
             )
             sid = _extract_msg_id(sent)
             if sid is not None:
