@@ -59,6 +59,24 @@
 - ماسک GUID و حذف GUID کامل: Pass
 - دو عبارت طبیعی فارسی و یک عبارت نامرتبط: Pass
 
+## Rubika Safe Control
+
+- ساخت chat_ref و message_ref بدون افشای GUID کامل: Pass
+- خواندن اخیر و جست‌وجوی پیام: Pass
+- آماده‌سازی ارسال بدون اجرای زودهنگام: Pass
+- تأیید مالک درست و رد مالک دیگر: Pass
+- جلوگیری از اجرای دوباره یک کد: Pass
+- ویرایش پیام خودی و رد پیام دیگران: Pass
+- حذف پیام خودی و رد پیام دیگران: Pass
+- پین و آن‌پین با دو تأیید مستقل: Pass
+- لغو و انقضای کد: Pass
+- رد تأیید در گروه و رد تأیید صوتی: Pass
+- انقضای chat_ref و message_ref: Pass
+- جلوگیری از ارسال token/API key: Pass
+- دو parser مستقیم برای خواندن/ارسال با ref: Pass
+- چهار parser مستقیم ویرایش/حذف/پین/آن‌پین: Pass
+- prepare مستقیم بدون اجرای زودهنگام: Pass
+
 ## Rubika Voice
 
 - Voice مالک در Saved Messages → Server Tool → متن+ویس: Pass
