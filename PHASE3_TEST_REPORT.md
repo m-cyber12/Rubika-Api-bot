@@ -76,6 +76,21 @@
 - دو parser مستقیم برای خواندن/ارسال با ref: Pass
 - چهار parser مستقیم ویرایش/حذف/پین/آن‌پین: Pass
 - prepare مستقیم بدون اجرای زودهنگام: Pass
+- ارسال مستقیم در حالت destructive_only: Pass
+- چهار عملیات حساس همچنان Pending: Pass
+- پنل Dashboard: لیست، تأیید، لغو، تاریخچه و Auth: Pass
+- جلوگیری از تأیید تکراری Dashboard: Pass
+- TTL پانزده دقیقه، chat_ref هفت روز و message_ref بیست‌وچهار ساعت: Pass
+- دو حالت جایگزین delete_only و none: Pass
+
+## Live JARVIS
+
+- VAD loop و رسم waveform: Pass (syntax/marker)
+- سکوت ۱٫۲ ثانیه و سقف نوبت ۳۰ ثانیه: Pass
+- دو turn مستقل WebM/OGG از endpoint: Pass
+- حالت‌های LISTENING/THINKING/SPEAKING: Pass (syntax/marker)
+- Mute، Interrupt و Stop cleanup: Pass (syntax/marker)
+- guard پردازش هم‌زمان: Pass
 
 ## Rubika Voice
 
