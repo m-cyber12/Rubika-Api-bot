@@ -1,14 +1,15 @@
 """
-🤖 دستیار روبیکا – مرحلهٔ دوم: ابزارهای امن سروری
+🤖 دستیار روبیکا – مرحلهٔ سوم: Voice + Dashboard Mic
 ═══════════════════════════════════════
 
-تمام قابلیت‌های مرحلهٔ اول حفظ شده‌اند و این ابزارها اضافه شده‌اند:
-- وضعیت امن منابع و uptime سرور
-- health-check URL عمومی با محافظت SSRF و redirect محدود
-- یادآوری تکی/ساعتی/روزانه/هفتگی با صف تحویل قابل retry
-- مانیتور سلامت URL و RSS با هشدار تغییر وضعیت/مطلب جدید
-- ساخت محدود فایل TXT/JSON/CSV و لینک دانلود امضاشده
-- ذخیرهٔ JSON اتمیک، بدون Shell و بدون دسترسی آزاد به فایل‌های سرور
+تمام قابلیت‌های مرحلهٔ دوم سروری حفظ شده‌اند و این موارد اضافه شده‌اند:
+- دریافت و دانلود امن Voice روبیکا فقط از OWNER_GUIDS
+- تبدیل گفتار به متن با Groq Whisper Large V3 Turbo
+- اجرای همان Agent و تمام ابزارها روی متن ویس
+- پاسخ متن + ویس فارسی با Edge TTS
+- ضبط میکروفن در Dashboard و پاسخ متن + صوت
+- محدودیت نوع/حجم، کنترل هم‌زمانی و fallback متنی در خطای TTS
+- پردازش صوت در حافظه و عدم نگهداری فایل صوتی کاربر روی دیسک
 
 متغیرهای جدید و ضروری:
 - OWNER_GUIDS=u0...[,u0...]       شناسه حساب‌های مجاز به Agent
@@ -30,6 +31,14 @@
 - AUTOMATION_DELIVERY_MODE=both
 - PUBLIC_BASE_URL=https://YOUR-SERVICE.onrender.com
 - FILE_SIGNING_SECRET=...          اختیاری؛ پیش‌فرض DASHBOARD_PASSWORD
+
+متغیرهای مرحلهٔ سوم:
+- GROQ_API_KEY=...                 ضروری برای Speech-to-Text
+- VOICE_STT_MODEL=whisper-large-v3-turbo
+- VOICE_LANGUAGE=fa               خالی برای تشخیص خودکار
+- VOICE_TTS_VOICE=fa-IR-FaridNeural
+- VOICE_MAX_BYTES=10000000
+- VOICE_MAX_SECONDS=60
 """
 
 import os
@@ -81,6 +90,10 @@ warnings.filterwarnings(
     message=r"(?s).*google\.generativeai.*",
 )
 import google.generativeai as genai
+try:
+    import edge_tts
+except ImportError:  # برنامه بدون TTS بالا می‌آید و در config غیرفعال گزارش می‌شود.
+    edge_tts = None
 from flask import Flask, Response, request, jsonify, render_template_string, send_file
 
 # ──────────────── لاگینگ ─────────────────
@@ -163,6 +176,33 @@ FILE_SIGNING_SECRET = os.environ.get(
     "FILE_SIGNING_SECRET", DASHBOARD_PASSWORD
 ).strip()
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+VOICE_STT_MODEL = os.environ.get(
+    "VOICE_STT_MODEL", "whisper-large-v3-turbo"
+).strip()
+VOICE_LANGUAGE = os.environ.get("VOICE_LANGUAGE", "fa").strip()
+VOICE_TTS_VOICE = os.environ.get(
+    "VOICE_TTS_VOICE", "fa-IR-FaridNeural"
+).strip()
+VOICE_MAX_BYTES = int(_float_env("VOICE_MAX_BYTES", 10_000_000, 100_000, 25_000_000))
+VOICE_MAX_SECONDS = int(_float_env("VOICE_MAX_SECONDS", 60, 5, 180))
+VOICE_TTS_MAX_CHARS = int(_float_env("VOICE_TTS_MAX_CHARS", 1500, 100, 3000))
+VOICE_MAX_OUTPUT_BYTES = int(
+    _float_env("VOICE_MAX_OUTPUT_BYTES", 3_000_000, 100_000, 8_000_000)
+)
+VOICE_ALLOWED_MIMES = {
+    "audio/ogg",
+    "audio/opus",
+    "audio/webm",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/wav",
+    "audio/x-wav",
+    "application/ogg",
+}
+
 try:
     SERVER_TZ = ZoneInfo(SERVER_TIMEZONE_NAME)
 except ZoneInfoNotFoundError:
@@ -193,6 +233,9 @@ _agent_memory_lock = threading.RLock()
 _agent_audit_lock = threading.Lock()
 _grounding_state_lock = threading.Lock()
 _automation_lock = threading.RLock()
+_voice_processing_semaphore = threading.BoundedSemaphore(2)
+_tts_cache_lock = threading.Lock()
+_tts_cache = OrderedDict()
 _grounding_blocked_until = 0.0
 _agent_context = threading.local()
 
@@ -202,6 +245,10 @@ if not OWNER_GUIDS:
     log.warning("⚠️ OWNER_GUIDS تنظیم نشده؛ Agent در روبیکا برای همه غیرفعال است.")
 if not DASHBOARD_PASSWORD:
     log.warning("⚠️ DASHBOARD_PASSWORD تنظیم نشده؛ داشبورد به‌صورت امن قفل است.")
+if not GROQ_API_KEY:
+    log.warning("⚠️ GROQ_API_KEY تنظیم نشده؛ ورودی صوتی غیرفعال است.")
+if edge_tts is None:
+    log.warning("⚠️ edge-tts نصب نشده؛ پاسخ صوتی غیرفعال و پاسخ متنی فعال است.")
 
 
 BOT_PERSONA = f"""
@@ -1695,6 +1742,221 @@ def delete_server_file(filename: str) -> str:
     return f"فایل {name} حذف شد."
 
 
+class VoiceProcessingError(RuntimeError):
+    pass
+
+
+def _safe_audio_filename(filename, mime_type=""):
+    value = os.path.basename(str(filename or "voice.ogg"))
+    value = re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:80]
+    if "." not in value:
+        extension = {
+            "audio/webm": ".webm",
+            "audio/mpeg": ".mp3",
+            "audio/mp4": ".m4a",
+            "audio/wav": ".wav",
+        }.get(str(mime_type).split(";", 1)[0].casefold(), ".ogg")
+        value += extension
+    return value or "voice.ogg"
+
+
+def _validate_audio_bytes(audio_bytes, mime_type="", strict_mime=False):
+    if not isinstance(audio_bytes, bytes) or not audio_bytes:
+        raise VoiceProcessingError("فایل صوتی خالی یا نامعتبر است.")
+    if len(audio_bytes) > VOICE_MAX_BYTES:
+        raise VoiceProcessingError(
+            f"حجم ویس بیشتر از {VOICE_MAX_BYTES // 1_000_000} مگابایت است."
+        )
+    normalized_mime = str(mime_type or "").split(";", 1)[0].strip().casefold()
+    short_mimes = {
+        "ogg": "audio/ogg",
+        "opus": "audio/opus",
+        "webm": "audio/webm",
+        "mp3": "audio/mpeg",
+        "mpeg": "audio/mpeg",
+        "m4a": "audio/x-m4a",
+        "mp4": "audio/mp4",
+        "wav": "audio/wav",
+    }
+    normalized_mime = short_mimes.get(normalized_mime, normalized_mime)
+    if "\r" in normalized_mime or "\n" in normalized_mime:
+        raise VoiceProcessingError("MIME صوتی نامعتبر است.")
+    if strict_mime and normalized_mime not in VOICE_ALLOWED_MIMES:
+        raise VoiceProcessingError("نوع فایل صوتی پشتیبانی نمی‌شود.")
+    if normalized_mime not in VOICE_ALLOWED_MIMES:
+        normalized_mime = "audio/ogg"
+    return normalized_mime
+
+
+def _build_groq_multipart(audio_bytes, filename, mime_type):
+    boundary = "----RubikaVoice" + uuid.uuid4().hex
+    chunks = []
+
+    def field(name, value):
+        chunks.extend([
+            f"--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+            str(value).encode("utf-8"),
+            b"\r\n",
+        ])
+
+    field("model", VOICE_STT_MODEL)
+    field("response_format", "json")
+    field("temperature", "0")
+    if VOICE_LANGUAGE:
+        field("language", VOICE_LANGUAGE)
+    chunks.extend([
+        f"--{boundary}\r\n".encode(),
+        (
+            'Content-Disposition: form-data; name="file"; '
+            f'filename="{filename}"\r\n'
+        ).encode(),
+        f"Content-Type: {mime_type}\r\n\r\n".encode(),
+        audio_bytes,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ])
+    return b"".join(chunks), boundary
+
+
+def transcribe_audio(audio_bytes, filename="voice.ogg", mime_type="audio/ogg"):
+    """Transcribe in-memory audio with Groq Whisper; audio is never written to disk."""
+    if not GROQ_API_KEY:
+        raise VoiceProcessingError("GROQ_API_KEY تنظیم نشده است.")
+    normalized_mime = _validate_audio_bytes(audio_bytes, mime_type)
+    safe_name = _safe_audio_filename(filename, normalized_mime)
+    body, boundary = _build_groq_multipart(
+        audio_bytes, safe_name, normalized_mime
+    )
+    request_obj = Request(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + GROQ_API_KEY,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+            "User-Agent": "RubikaVoiceAgent/3.0",
+        },
+    )
+    last_error = ""
+    for attempt in range(2):
+        try:
+            with urlopen(request_obj, timeout=60) as response:
+                raw = response.read(1_000_000).decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            text = " ".join(str(data.get("text") or "").split())
+            if not text:
+                raise VoiceProcessingError("متنی از ویس تشخیص داده نشد.")
+            _audit_tool("voice_transcription", "ok", f"bytes={len(audio_bytes)}")
+            return text[:5000]
+        except HTTPError as exc:
+            status = int(exc.code)
+            try:
+                exc.read(1000)
+            except Exception:
+                pass
+            finally:
+                exc.close()
+            last_error = f"Groq HTTP {status}"
+            if status not in {429, 500, 502, 503, 504} or attempt == 1:
+                _audit_tool("voice_transcription", "error", last_error)
+                raise VoiceProcessingError(last_error) from exc
+            time.sleep(1.0)
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = type(exc).__name__
+            if attempt == 1:
+                _audit_tool("voice_transcription", "error", last_error)
+                raise VoiceProcessingError(f"خطای ارتباط STT: {last_error}") from exc
+            time.sleep(1.0)
+        except VoiceProcessingError:
+            raise
+    raise VoiceProcessingError(last_error or "خطای ناشناخته STT")
+
+
+def _tts_clean_text(text):
+    value = str(text or "")
+    value = re.sub(r"https?://\S+", "", value)
+    value = re.sub(r"[`*_#>|]", " ", value)
+    value = " ".join(value.split())
+    return value[:VOICE_TTS_MAX_CHARS]
+
+
+async def synthesize_speech(text):
+    """Generate Persian MP3 bytes with Edge TTS, with a small in-memory cache."""
+    if edge_tts is None:
+        raise VoiceProcessingError("edge-tts نصب نشده است.")
+    clean_text = _tts_clean_text(text)
+    if not clean_text:
+        raise VoiceProcessingError("متن قابل خواندن صوتی خالی است.")
+    cache_key = hashlib.sha256(
+        f"{VOICE_TTS_VOICE}|{clean_text}".encode("utf-8")
+    ).hexdigest()
+    with _tts_cache_lock:
+        cached = _tts_cache.get(cache_key)
+        if cached:
+            _tts_cache.move_to_end(cache_key)
+            return cached
+
+    chunks = []
+    total_bytes = 0
+    communicator = edge_tts.Communicate(clean_text, VOICE_TTS_VOICE)
+    async for chunk in communicator.stream():
+        if chunk.get("type") == "audio" and chunk.get("data"):
+            audio_chunk = bytes(chunk["data"])
+            chunks.append(audio_chunk)
+            total_bytes += len(audio_chunk)
+            if total_bytes > VOICE_MAX_OUTPUT_BYTES:
+                raise VoiceProcessingError("خروجی صوتی بیش از حد بزرگ شد.")
+    audio = b"".join(chunks)
+    if not audio:
+        raise VoiceProcessingError("سرویس TTS خروجی صوتی نداد.")
+    with _tts_cache_lock:
+        _tts_cache[cache_key] = audio
+        _tts_cache.move_to_end(cache_key)
+        while len(_tts_cache) > 10:
+            _tts_cache.popitem(last=False)
+    _audit_tool("voice_synthesis", "ok", f"bytes={len(audio)}")
+    return audio
+
+
+def synthesize_speech_sync(text):
+    return asyncio.run(synthesize_speech(text))
+
+
+def _is_voice_update(update):
+    try:
+        file_inline = getattr(update, "file_inline", None)
+        return bool(file_inline is not None and getattr(file_inline, "type", None) == "Voice")
+    except Exception:
+        return False
+
+
+def _voice_update_metadata(update):
+    file_inline = getattr(update, "file_inline", None)
+    size = int(getattr(file_inline, "size", 0) or 0)
+    mime = str(getattr(file_inline, "mime", "") or "audio/ogg")
+    filename = str(getattr(file_inline, "file_name", "") or "voice.ogg")
+    return size, mime, filename
+
+
+async def _reply_text_and_voice(update, text, with_voice=False):
+    sent = await update.reply(text)
+    if not with_voice:
+        return sent
+    try:
+        audio = await synthesize_speech(text)
+        await update.reply_voice(
+            audio,
+            file_name="loki_reply.mp3",
+            audio_info=True,
+        )
+    except Exception as exc:
+        log.warning("VOICE REPLY TTS ERROR: %s", exc)
+        _audit_tool("voice_synthesis", "error", type(exc).__name__)
+    return sent
+
+
 def get_current_datetime() -> str:
     """Return current date/time in the configured server timezone."""
     now = datetime.now(SERVER_TZ)
@@ -2345,6 +2607,7 @@ def execute_direct_server_command(command, actor, chat_guid=""):
 # ════════════════════════════════════════
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = VOICE_MAX_BYTES + 1_000_000
 
 
 def _dashboard_authorized():
@@ -2573,6 +2836,9 @@ body::before{
   cursor:pointer;transition:var(--transition);display:flex;align-items:center;gap:8px;
 }
 .send-btn:hover{transform:scale(1.02);box-shadow:var(--glow-1)}
+#btn-voice{min-width:48px;padding:12px;display:flex;align-items:center;justify-content:center}
+#btn-voice.recording{background:#ef4444;border-color:#ef4444;animation:pulse 1s infinite}
+.voice-player{width:100%;margin-top:8px;height:36px}
 
 /* ───── Forms ───── */
 .form-group{margin-bottom:16px}
@@ -2790,9 +3056,11 @@ body::before{
         <div class="chat-container">
           <div class="chat-messages" id="chat-box"></div>
           <div class="chat-input-wrap">
-            <input type="text" class="chat-input" id="chat-in" placeholder="پیامت رو بنویس...">
+            <input type="text" class="chat-input" id="chat-in" placeholder="پیامت رو بنویس یا میکروفن را بزن...">
+            <button class="header-btn" id="btn-voice" title="ضبط ویس"><i class="fas fa-microphone"></i></button>
             <button class="send-btn" id="btn-chat-send"><i class="fas fa-paper-plane"></i> ارسال</button>
           </div>
+          <div id="voice-status" style="font-size:12px;color:var(--text-secondary);margin-top:8px"></div>
         </div>
       </div>
     </div>
@@ -2920,6 +3188,66 @@ async function sendChat(){
 document.getElementById('btn-chat-send').onclick=sendChat;
 document.getElementById('chat-in').onkeydown=e=>{if(e.key==='Enter')sendChat();};
 
+// ───── Voice Chat ─────
+let voiceRecorder=null,voiceStream=null,voiceChunks=[],voiceTimer=null;
+function setVoiceStatus(text,error=false){
+  const el=document.getElementById('voice-status');el.textContent=text||'';
+  el.style.color=error?'#ef4444':'var(--text-secondary)';
+}
+async function submitVoice(blob){
+  const box=document.getElementById('chat-box');
+  const loading=document.createElement('div');loading.className='msg msg-ai';loading.id='voice-loading';
+  loading.innerHTML='<div class="spinner"></div><div class="msg-meta"><i class="fas fa-microphone"></i> در حال تبدیل و پردازش ویس...</div>';
+  box.appendChild(loading);box.scrollTop=box.scrollHeight;
+  try{
+    const form=new FormData();
+    const ext=blob.type.includes('ogg')?'ogg':blob.type.includes('mp4')?'m4a':'webm';
+    form.append('audio',blob,'dashboard_voice.'+ext);
+    const r=await fetch('/api/voice/chat',{method:'POST',body:form});
+    const d=await r.json();document.getElementById('voice-loading')?.remove();
+    if(!r.ok)throw new Error(d.error||'خطای پردازش ویس');
+    box.innerHTML+='<div class="msg msg-user"><div>🎙️ '+esc(d.transcript)+'</div><div class="msg-meta"><i class="fas fa-user"></i> تو</div></div>';
+    const reply=document.createElement('div');reply.className='msg msg-ai';
+    reply.innerHTML='<div>'+esc(d.reply||'')+'</div><div class="msg-meta"><i class="fas fa-robot"></i> AI Voice</div>';
+    if(d.audio_base64){
+      const binary=atob(d.audio_base64),bytes=new Uint8Array(binary.length);
+      for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+      const audio=document.createElement('audio');audio.controls=true;audio.className='voice-player';
+      audio.src=URL.createObjectURL(new Blob([bytes],{type:d.audio_mime||'audio/mpeg'}));
+      reply.appendChild(audio);audio.play().catch(()=>{});
+    }
+    box.appendChild(reply);box.scrollTop=box.scrollHeight;
+    setVoiceStatus(d.tts_error?'پاسخ متنی آماده شد؛ ساخت صوت ناموفق بود.':'ویس پردازش شد.',!!d.tts_error);
+  }catch(e){
+    document.getElementById('voice-loading')?.remove();setVoiceStatus(e.message||'خطای ویس',true);
+  }
+}
+async function toggleVoiceRecording(){
+  const button=document.getElementById('btn-voice');
+  if(voiceRecorder&&voiceRecorder.state==='recording'){voiceRecorder.stop();return;}
+  if(!navigator.mediaDevices?.getUserMedia||typeof MediaRecorder==='undefined'){
+    setVoiceStatus('مرورگر شما ضبط صدا را پشتیبانی نمی‌کند.',true);return;
+  }
+  try{
+    voiceStream=await navigator.mediaDevices.getUserMedia({audio:true});voiceChunks=[];
+    let options={};
+    for(const mime of ['audio/webm;codecs=opus','audio/ogg;codecs=opus','audio/webm']){
+      if(MediaRecorder.isTypeSupported(mime)){options={mimeType:mime};break;}
+    }
+    voiceRecorder=new MediaRecorder(voiceStream,options);
+    voiceRecorder.ondataavailable=e=>{if(e.data?.size)voiceChunks.push(e.data);};
+    voiceRecorder.onstop=()=>{
+      clearTimeout(voiceTimer);button.classList.remove('recording');
+      voiceStream?.getTracks().forEach(track=>track.stop());
+      const blob=new Blob(voiceChunks,{type:voiceRecorder.mimeType||'audio/webm'});
+      setVoiceStatus('در حال ارسال ویس...');submitVoice(blob);
+    };
+    voiceRecorder.start();button.classList.add('recording');setVoiceStatus('در حال ضبط... برای توقف دوباره بزنید.');
+    voiceTimer=setTimeout(()=>{if(voiceRecorder?.state==='recording')voiceRecorder.stop();},60000);
+  }catch(e){setVoiceStatus('اجازه میکروفن داده نشد یا خطایی رخ داد.',true);}
+}
+document.getElementById('btn-voice').onclick=toggleVoiceRecording;
+
 // ───── Send Message ─────
 async function sendMsg(){
   const g=document.getElementById('s-guid').value.trim();
@@ -3028,6 +3356,8 @@ async function loadConfig(){
       ['DASHBOARD_PASSWORD','رمز امن داشبورد'],
       ['PUBLIC_BASE_URL','آدرس عمومی برای دانلود فایل'],
       ['SERVER_TIMEZONE','منطقه زمانی سرور'],
+      ['GROQ_API_KEY','کلید Groq برای تشخیص گفتار'],
+      ['EDGE_TTS','موتور پاسخ صوتی'],
       ['RUBIKA_PHONE','شماره تلفن'],
     ];
     let html='<table class="config-table"><thead><tr><th>متغیر</th><th>وضعیت</th></tr></thead><tbody>';
@@ -3076,7 +3406,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase2-server-tools-v1.0",
+        "version": "phase3-voice-v1.0",
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -3127,6 +3457,32 @@ def automation_status():
     })
 
 
+@app.route("/api/voice/status")
+def voice_status():
+    with _tts_cache_lock:
+        cache_items = len(_tts_cache)
+        cache_bytes = sum(len(item) for item in _tts_cache.values())
+    return jsonify({
+        "enabled": bool(GROQ_API_KEY and edge_tts is not None),
+        "stt": {
+            "configured": bool(GROQ_API_KEY),
+            "model": VOICE_STT_MODEL,
+            "language": VOICE_LANGUAGE or "auto",
+        },
+        "tts": {
+            "available": edge_tts is not None,
+            "voice": VOICE_TTS_VOICE,
+            "cache_items": cache_items,
+            "cache_bytes": cache_bytes,
+        },
+        "limits": {
+            "max_input_bytes": VOICE_MAX_BYTES,
+            "max_seconds": VOICE_MAX_SECONDS,
+            "max_tts_chars": VOICE_TTS_MAX_CHARS,
+        },
+    })
+
+
 @app.route("/api/stats")
 def api_stats():
     today = datetime.now().strftime("%Y-%m-%d")
@@ -3139,6 +3495,27 @@ def api_stats():
     return jsonify({"kb": kb_count, "pen": pen_count, "today": today_count})
 
 
+def _process_dashboard_message(msg, actor):
+    server_command = parse_server_command(msg)
+    if server_command:
+        return execute_direct_server_command(server_command, actor=actor), "server_tool"
+    if is_direct_web_request(msg):
+        return execute_direct_web_search(msg, actor=actor), "direct_web_search"
+    if not agent_model:
+        raise RuntimeError("GEMINI_API_KEY تنظیم نشده – Agent غیرفعال است.")
+    with _lock_kb:
+        kb_items = list(knowledge_base.items())[-5:]
+    kb_ctx = ""
+    if kb_items:
+        kb_ctx = "\nاطلاعات پایگاه دانش:\n" + "\n".join(
+            f"- {q}: {a}" for q, a in kb_items
+        )
+    response = execute_agent_with_rotation_sync(
+        "dashboard", msg + kb_ctx, actor=actor
+    )
+    return response_text(response), "agent"
+
+
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     data = request.get_json(silent=True) or {}
@@ -3147,40 +3524,59 @@ def api_chat():
         return jsonify({"error": "Empty"}), 400
     if len(msg) > 4000:
         return jsonify({"error": "Message is too long"}), 413
-
     actor = f"dashboard:{request.remote_addr or 'unknown'}"
-    server_command = parse_server_command(msg)
-    if server_command:
-        reply = execute_direct_server_command(server_command, actor=actor)
-        return jsonify({"reply": reply, "mode": "server_tool"})
-
-    if is_direct_web_request(msg):
-        try:
-            reply = execute_direct_web_search(msg, actor=actor)
-            return jsonify({"reply": reply, "mode": "direct_web_search"})
-        except Exception as exc:
-            log.error("DIRECT SEARCH ERROR: %s", exc, exc_info=True)
-            return jsonify({"error": "Web search temporarily unavailable"}), 502
-
-    if not agent_model:
-        return jsonify({"error": "GEMINI_API_KEY تنظیم نشده – Agent غیرفعاله."}), 503
-
     try:
-        with _lock_kb:
-            kb_items = list(knowledge_base.items())[-5:]
-        kb_ctx = ""
-        if kb_items:
-            kb_ctx = "\nاطلاعات پایگاه دانش:\n" + "\n".join(
-                f"- {q}: {a}" for q, a in kb_items
-            )
-
-        res = execute_agent_with_rotation_sync(
-            "dashboard", msg + kb_ctx, actor=actor
-        )
-        return jsonify({"reply": response_text(res)})
+        reply, mode = _process_dashboard_message(msg, actor)
+        return jsonify({"reply": reply, "mode": mode})
     except Exception as exc:
-        log.error("AGENT CHAT ERROR: %s", exc, exc_info=True)
+        log.error("DASHBOARD CHAT ERROR: %s", exc, exc_info=True)
         return jsonify({"error": "Agent temporarily unavailable"}), 500
+
+
+@app.route("/api/voice/chat", methods=["POST"])
+def api_voice_chat():
+    if not GROQ_API_KEY:
+        return jsonify({"error": "GROQ_API_KEY تنظیم نشده است."}), 503
+    if not _voice_processing_semaphore.acquire(blocking=False):
+        return jsonify({"error": "Voice service is busy"}), 429
+    try:
+        upload = request.files.get("audio")
+        if upload is None:
+            return jsonify({"error": "Audio file is required"}), 400
+        filename = _safe_audio_filename(upload.filename, upload.mimetype)
+        mime = str(upload.mimetype or "").split(";", 1)[0].casefold()
+        allowed_extensions = {".ogg", ".opus", ".webm", ".mp3", ".m4a", ".mp4", ".wav"}
+        extension = os.path.splitext(filename)[1].casefold()
+        if mime not in VOICE_ALLOWED_MIMES and extension not in allowed_extensions:
+            return jsonify({"error": "Unsupported audio type"}), 415
+        audio = upload.stream.read(VOICE_MAX_BYTES + 1)
+        _validate_audio_bytes(audio, mime or "audio/ogg")
+        transcript = transcribe_audio(audio, filename, mime or "audio/ogg")
+        actor = f"dashboard-voice:{request.remote_addr or 'unknown'}"
+        reply, mode = _process_dashboard_message(transcript, actor)
+        audio_b64 = None
+        tts_error = ""
+        try:
+            speech = synthesize_speech_sync(reply)
+            audio_b64 = base64.b64encode(speech).decode("ascii")
+        except Exception as exc:
+            tts_error = str(exc)[:300]
+            log.warning("DASHBOARD TTS ERROR: %s", exc)
+        return jsonify({
+            "transcript": transcript,
+            "reply": reply,
+            "mode": mode,
+            "audio_base64": audio_b64,
+            "audio_mime": "audio/mpeg" if audio_b64 else None,
+            "tts_error": tts_error or None,
+        })
+    except VoiceProcessingError as exc:
+        return jsonify({"error": str(exc)}), 422
+    except Exception as exc:
+        log.error("VOICE CHAT ERROR: %s", exc, exc_info=True)
+        return jsonify({"error": "Voice processing failed"}), 500
+    finally:
+        _voice_processing_semaphore.release()
 
 
 @app.route("/api/send", methods=["POST"])
@@ -3338,6 +3734,8 @@ def api_config():
             "DASHBOARD_PASSWORD": bool(DASHBOARD_PASSWORD),
             "PUBLIC_BASE_URL": bool(PUBLIC_BASE_URL),
             "SERVER_TIMEZONE": bool(SERVER_TIMEZONE_NAME),
+            "GROQ_API_KEY": bool(GROQ_API_KEY),
+            "EDGE_TTS": edge_tts is not None,
             "RUBIKA_PHONE": bool(os.environ.get("RUBIKA_PHONE") or os.environ.get("rubika_phone")),
             "OWNER_NAME": OWNER_NAME,
         },
@@ -3363,6 +3761,16 @@ def api_config():
             "active_monitors": active_monitors,
             "signed_downloads": bool(PUBLIC_BASE_URL and FILE_SIGNING_SECRET),
             "storage": "json_ephemeral",
+        },
+        "voice": {
+            "enabled": bool(GROQ_API_KEY and edge_tts is not None),
+            "stt_enabled": bool(GROQ_API_KEY),
+            "tts_enabled": edge_tts is not None,
+            "stt_model": VOICE_STT_MODEL,
+            "language": VOICE_LANGUAGE or "auto",
+            "tts_voice": VOICE_TTS_VOICE,
+            "max_input_bytes": VOICE_MAX_BYTES,
+            "max_seconds": VOICE_MAX_SECONDS,
         },
     })
 
@@ -3570,11 +3978,57 @@ async def handle_messages(update: Updates):
     author_guid = getattr(update, "author_guid", "") or ""
     owner_authorized = is_owner_message(author_guid, chat_guid)
     raw_msg_id = getattr(update, "message_id", None)
+    voice_input = False
 
     try:
         message_id = int(raw_msg_id) if raw_msg_id is not None else None
     except (ValueError, TypeError):
         message_id = None
+
+    if _is_voice_update(update):
+        if not owner_authorized:
+            log.warning(
+                "VOICE ignored for non-owner chat=%s author=%s",
+                _mask_guid(chat_guid),
+                _mask_guid(author_guid),
+            )
+            return
+        if not _voice_processing_semaphore.acquire(blocking=False):
+            await update.reply("سرویس ویس مشغول است؛ چند لحظه دیگر دوباره امتحان کنید.")
+            return
+        try:
+            size, mime, filename = _voice_update_metadata(update)
+            if size and size > VOICE_MAX_BYTES:
+                raise VoiceProcessingError("حجم ویس بیشتر از حد مجاز است.")
+            file_inline = getattr(update, "file_inline", None)
+            duration = int(getattr(file_inline, "time", 0) or 0)
+            if duration and duration > VOICE_MAX_SECONDS * 1000:
+                raise VoiceProcessingError(
+                    f"مدت ویس بیشتر از {VOICE_MAX_SECONDS} ثانیه است."
+                )
+            audio_bytes = await update.download()
+            _validate_audio_bytes(audio_bytes, mime)
+            user_text = await asyncio.to_thread(
+                transcribe_audio,
+                audio_bytes,
+                filename,
+                mime,
+            )
+            voice_input = True
+            log.info(
+                "VOICE transcribed chat=%s chars=%s",
+                _mask_guid(chat_guid),
+                len(user_text),
+            )
+        except VoiceProcessingError as exc:
+            await update.reply(f"❌ پردازش ویس ناموفق بود: {exc}")
+            return
+        except Exception as exc:
+            log.error("VOICE DOWNLOAD/STT ERROR: %s", exc, exc_info=True)
+            await update.reply("❌ پردازش ویس به‌دلیل خطای داخلی ناموفق بود.")
+            return
+        finally:
+            _voice_processing_semaphore.release()
 
     if not user_text:
         return
@@ -3724,7 +4178,9 @@ async def handle_messages(update: Updates):
             chat_guid,
         )
         try:
-            sent = await update.reply(reply_text)
+            sent = await _reply_text_and_voice(
+                update, reply_text, with_voice=voice_input
+            )
             sid = _extract_msg_id(sent)
             if sid is not None:
                 with _lock_sent:
@@ -3743,7 +4199,9 @@ async def handle_messages(update: Updates):
                 user_text,
                 f"rubika:{author_guid or chat_guid}",
             )
-            sent = await update.reply(direct_reply)
+            sent = await _reply_text_and_voice(
+                update, direct_reply, with_voice=voice_input
+            )
             sid = _extract_msg_id(sent)
             if sid is not None:
                 with _lock_sent:
@@ -3766,7 +4224,9 @@ async def handle_messages(update: Updates):
     if kb_answer:
         try:
             await asyncio.sleep(random.uniform(REPLY_DELAY_MIN, REPLY_DELAY_MAX))
-            sent = await update.reply(kb_answer)
+            sent = await _reply_text_and_voice(
+                update, kb_answer, with_voice=voice_input
+            )
             sid = _extract_msg_id(sent)
             if sid is not None:
                 with _lock_sent:
@@ -3862,7 +4322,9 @@ async def handle_messages(update: Updates):
                     log.error(f"NOTIF ERROR: {e}")
 
             try:
-                sent = await update.reply(ai_text)
+                sent = await _reply_text_and_voice(
+                    update, ai_text, with_voice=voice_input
+                )
                 sid = _extract_msg_id(sent)
                 if sid is not None:
                     with _lock_sent:
@@ -3873,7 +4335,9 @@ async def handle_messages(update: Updates):
             except Exception as e:
                 log.error(f"REPLY ERROR: {e}")
         else:
-            sent = await update.reply(ai_text)
+            sent = await _reply_text_and_voice(
+                update, ai_text, with_voice=voice_input
+            )
             sid = _extract_msg_id(sent)
             if sid is not None:
                 with _lock_sent:
@@ -3925,6 +4389,10 @@ if __name__ == "__main__":
     print(f"🔑 Gemini API    : {'✅ فعال (' + str(len(GEMINI_API_KEYS)) + ' کلید)' if GEMINI_API_KEYS else '❌ غیرفعال'}")
     print(f"🔑 Rubika Session: {'✅ موجود' if os.path.exists(SESSION_FILE) else '❌ ناموجود'}")
     print(f"🛠️ Server Tools  : ✅ فعال | TZ={SERVER_TIMEZONE_NAME} | Delivery={AUTOMATION_DELIVERY_MODE}")
+    print(
+        f"🎙️ Voice         : STT={'✅' if GROQ_API_KEY else '❌'} "
+        f"| TTS={'✅' if edge_tts is not None else '❌'} | {VOICE_TTS_VOICE}"
+    )
     print(f"🧠 KB: {len(knowledge_base)} | ⏳ Pending: {len(pending_replies)}")
     print("=" * 55)
 
