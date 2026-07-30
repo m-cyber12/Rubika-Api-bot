@@ -46,6 +46,18 @@
 - TTS ناموفق و حفظ متن: Pass
 - MediaRecorder/getUserMedia wiring: Pass
 - توقف خودکار ۶۰ ثانیه: Pass
+- دو پیام متنی Dashboard با درخواست صوتی و پخش‌کننده: Pass
+- دو پیام متنی Dashboard بدون درخواست صوتی: Pass
+- شکست TTS پیام متنی و حفظ پاسخ: Pass
+
+## Rubika Read-only
+
+- جست‌وجوی نام از get_chats/get_contacts/search_global_objects: Pass
+- دو query مستقل با نتیجه: Pass
+- no-result و partial API failure: Pass
+- حذف متن last_message و شماره تلفن از خروجی: Pass
+- ماسک GUID و حذف GUID کامل: Pass
+- دو عبارت طبیعی فارسی و یک عبارت نامرتبط: Pass
 
 ## Rubika Voice
 

@@ -282,6 +282,8 @@ AGENT_PERSONA = BOT_PERSONA + f"""
 - برای مانیتور از create_server_monitor استفاده کن؛ فقط URL عمومی و interval حداقل ۵ دقیقه.
 - برای ساخت فایل فقط از create_server_file با پسوند txt/json/csv استفاده کن.
 - تو به Shell، فایل‌های خارج از server_files، شبکهٔ خصوصی یا metadata سرور دسترسی نداری.
+- برای یافتن نام یک چت/مخاطب روبیکا فقط از search_rubika_readonly استفاده کن؛ این ابزار خواندنی است.
+- Dashboard و روبیکا می‌توانند پاسخ را خودکار صوتی کنند؛ اگر کاربر ویس خواست هرگز نگو امکان ارسال ویس نداری، فقط پاسخ عادی را تولید کن.
 - در هر درخواست فقط ابزار لازم را صدا بزن و پاسخ نهایی را کوتاه، فارسی و همراه با لینک منابع بنویس.
 """
 
@@ -1924,6 +1926,17 @@ def synthesize_speech_sync(text):
     return asyncio.run(synthesize_speech(text))
 
 
+def _optional_dashboard_audio(text, requested):
+    if not requested:
+        return None, None, ""
+    try:
+        speech = synthesize_speech_sync(text)
+        return base64.b64encode(speech).decode("ascii"), "audio/mpeg", ""
+    except Exception as exc:
+        log.warning("DASHBOARD TEXT TTS ERROR: %s", exc)
+        return None, None, str(exc)[:300]
+
+
 def _is_voice_update(update):
     try:
         file_inline = getattr(update, "file_inline", None)
@@ -1987,6 +2000,164 @@ async def _reply_text_and_voice(update, text, with_voice=False):
     return sent
 
 
+def _run_rubika_coroutine_sync(coroutine, timeout=25):
+    if main_loop is None:
+        ready = main_loop_ready.wait(timeout=10)
+        if not ready:
+            coroutine.close()
+            raise RuntimeError("Rubika event loop هنوز آماده نیست.")
+    if main_loop is None or main_loop.is_closed():
+        coroutine.close()
+        raise RuntimeError("Rubika event loop در دسترس نیست.")
+    future = asyncio.run_coroutine_threadsafe(coroutine, main_loop)
+    try:
+        return future.result(timeout=timeout)
+    except Exception:
+        future.cancel()
+        raise
+
+
+def _plain_rubika_value(value, depth=0):
+    if depth > 8:
+        return None
+    if hasattr(value, "original_update"):
+        value = value.original_update
+    if isinstance(value, dict):
+        return {
+            str(key): _plain_rubika_value(item, depth + 1)
+            for key, item in value.items()
+            if str(key) not in {"client", "access_hash_rec", "access_hash_send", "phone"}
+        }
+    if isinstance(value, list):
+        return [_plain_rubika_value(item, depth + 1) for item in value[:500]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)[:300]
+
+
+def _extract_rubika_entities(payload, query):
+    query_folded = str(query or "").casefold()
+    found = []
+    seen = set()
+    guid_keys = ("object_guid", "user_guid", "group_guid", "channel_guid")
+    name_keys = ("title", "name", "first_name", "last_name", "username")
+
+    def walk(value, depth=0):
+        if depth > 8:
+            return
+        if isinstance(value, dict):
+            guid = next((str(value.get(key)) for key in guid_keys if value.get(key)), "")
+            parts = [str(value.get(key) or "").strip() for key in name_keys]
+            display = " ".join(part for part in parts if part)
+            if guid and display and query_folded in display.casefold():
+                dedupe = (guid, display.casefold())
+                if dedupe not in seen:
+                    seen.add(dedupe)
+                    prefix = guid[:2]
+                    object_type = {"u0": "user", "g0": "group", "c0": "channel"}.get(prefix, "chat")
+                    found.append({
+                        "name": display[:160],
+                        "type": object_type,
+                        "guid_mask": _mask_guid(guid),
+                    })
+            for key, item in value.items():
+                if key not in {"last_message", "messages", "message_updates"}:
+                    walk(item, depth + 1)
+        elif isinstance(value, list):
+            for item in value[:500]:
+                walk(item, depth + 1)
+
+    walk(payload)
+    return found[:10]
+
+
+def search_rubika_readonly(query: str) -> str:
+    """Search Rubika chats, contacts, and global objects without reading messages.
+
+    Args:
+        query: Name or username fragment to find. Results contain only display
+            name, object type, and a masked GUID; phone numbers/messages are excluded.
+    """
+    clean_query = " ".join(str(query or "").split())[:80]
+    if not clean_query:
+        return "عبارت جست‌وجوی روبیکا خالی است."
+
+    async def collect():
+        calls = (
+            client.get_chats(),
+            client.get_contacts(),
+            client.search_global_objects(clean_query),
+        )
+        return await asyncio.gather(*calls, return_exceptions=True)
+
+    try:
+        responses = _run_rubika_coroutine_sync(collect())
+    except Exception as exc:
+        _audit_tool("search_rubika_readonly", "error", type(exc).__name__)
+        return f"جست‌وجوی روبیکا ناموفق بود: {exc}"
+
+    results = []
+    errors = 0
+    for response in responses:
+        if isinstance(response, Exception):
+            errors += 1
+            continue
+        plain = _plain_rubika_value(response)
+        results.extend(_extract_rubika_entities(plain, clean_query))
+    unique = []
+    seen = set()
+    for item in results:
+        key = (item["name"].casefold(), item["guid_mask"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+        if len(unique) >= 10:
+            break
+    _audit_tool(
+        "search_rubika_readonly",
+        "ok" if unique else "no_results",
+        f"results={len(unique)}; partial_errors={errors}",
+    )
+    if not unique:
+        return "هیچ چت یا مخاطب روبیکایی با این نام پیدا نشد."
+    return json.dumps({"query": clean_query, "results": unique}, ensure_ascii=False)
+
+
+def _pretty_rubika_search_result(raw_result):
+    try:
+        payload = json.loads(raw_result)
+    except (TypeError, json.JSONDecodeError):
+        return raw_result
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list) or not results:
+        return raw_result
+    lines = [f"🔎 نتایج روبیکا برای «{payload.get('query', '')}»:"]
+    for index, item in enumerate(results[:10], 1):
+        lines.append(
+            f"{index}. {item.get('name', 'بدون نام')} | "
+            f"{item.get('type', 'chat')} | {item.get('guid_mask', '-') }"
+        )
+    return "\n".join(lines)
+
+
+def _parse_rubika_read_request(text):
+    value = " ".join(str(text or "").split())
+    folded = value.casefold()
+    if "روبیکا" not in folded:
+        return None
+    if not any(word in folded for word in ("پیدا", "جستجو", "جست‌وجو", "پیوی", "مخاطب", "چت")):
+        return None
+    match = re.search(
+        r"(?:به\s+نام|اسم|نام)\s+(.+?)(?:\s+(?:رو\s+)?(?:پیدا|پیداش|جستجو|جست‌وجو)|[،,.؟]|$)",
+        value,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    query = match.group(1).strip(" '\"«»")[:80]
+    return query or None
+
+
 def get_current_datetime() -> str:
     """Return current date/time in the configured server timezone."""
     now = datetime.now(SERVER_TZ)
@@ -2011,6 +2182,7 @@ AGENT_TOOLS = [
     create_server_file,
     list_server_files,
     delete_server_file,
+    search_rubika_readonly,
 ]
 
 model = None
@@ -3194,6 +3366,14 @@ function switchTab(name){
 document.querySelectorAll('.nav-item').forEach(n=>n.onclick=()=>switchTab(n.dataset.tab));
 
 // ───── Chat ─────
+function appendAudioPlayer(container,data){
+  if(!data?.audio_base64)return false;
+  const binary=atob(data.audio_base64),bytes=new Uint8Array(binary.length);
+  for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+  const audio=document.createElement('audio');audio.controls=true;audio.className='voice-player';
+  audio.src=URL.createObjectURL(new Blob([bytes],{type:data.audio_mime||'audio/mpeg'}));
+  container.appendChild(audio);audio.play().catch(()=>{});return true;
+}
 async function sendChat(){
   const inp=document.getElementById('chat-in');
   const t=inp.value.trim();if(!t)return;
@@ -3208,7 +3388,11 @@ async function sendChat(){
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:t})});
     const d=await r.json();
     document.getElementById('loading-msg')?.remove();
-    box.innerHTML+='<div class="msg msg-ai"><div>'+esc(d.reply||d.error||'خطا')+'</div><div class="msg-meta"><i class="fas fa-robot"></i> AI</div></div>';
+    if(!r.ok)throw new Error(d.error||'خطای Agent');
+    const reply=document.createElement('div');reply.className='msg msg-ai';
+    reply.innerHTML='<div>'+esc(d.reply||'خطا')+'</div><div class="msg-meta"><i class="fas fa-robot"></i> AI</div>';
+    appendAudioPlayer(reply,d);box.appendChild(reply);
+    if(d.tts_error)setVoiceStatus('پاسخ متنی آماده شد؛ ساخت صوت ناموفق بود.',true);
     box.scrollTop=box.scrollHeight;
   }catch(e){
     document.getElementById('loading-msg')?.remove();
@@ -3239,13 +3423,7 @@ async function submitVoice(blob){
     box.innerHTML+='<div class="msg msg-user"><div>🎙️ '+esc(d.transcript)+'</div><div class="msg-meta"><i class="fas fa-user"></i> تو</div></div>';
     const reply=document.createElement('div');reply.className='msg msg-ai';
     reply.innerHTML='<div>'+esc(d.reply||'')+'</div><div class="msg-meta"><i class="fas fa-robot"></i> AI Voice</div>';
-    if(d.audio_base64){
-      const binary=atob(d.audio_base64),bytes=new Uint8Array(binary.length);
-      for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
-      const audio=document.createElement('audio');audio.controls=true;audio.className='voice-player';
-      audio.src=URL.createObjectURL(new Blob([bytes],{type:d.audio_mime||'audio/mpeg'}));
-      reply.appendChild(audio);audio.play().catch(()=>{});
-    }
+    appendAudioPlayer(reply,d);
     box.appendChild(reply);box.scrollTop=box.scrollHeight;
     setVoiceStatus(d.tts_error?'پاسخ متنی آماده شد؛ ساخت صوت ناموفق بود.':'ویس پردازش شد.',!!d.tts_error);
   }catch(e){
@@ -3436,7 +3614,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase3-voice-v1.1-text-trigger",
+        "version": "phase3-voice-v1.2-dashboard-audio-rubika-read",
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -3526,6 +3704,10 @@ def api_stats():
 
 
 def _process_dashboard_message(msg, actor):
+    rubika_query = _parse_rubika_read_request(msg)
+    if rubika_query:
+        result = search_rubika_readonly(rubika_query)
+        return _pretty_rubika_search_result(result), "rubika_readonly"
     server_command = parse_server_command(msg)
     if server_command:
         return execute_direct_server_command(server_command, actor=actor), "server_tool"
@@ -3557,7 +3739,16 @@ def api_chat():
     actor = f"dashboard:{request.remote_addr or 'unknown'}"
     try:
         reply, mode = _process_dashboard_message(msg, actor)
-        return jsonify({"reply": reply, "mode": mode})
+        audio_b64, audio_mime, tts_error = _optional_dashboard_audio(
+            reply, _should_reply_with_voice(msg)
+        )
+        return jsonify({
+            "reply": reply,
+            "mode": mode,
+            "audio_base64": audio_b64,
+            "audio_mime": audio_mime,
+            "tts_error": tts_error or None,
+        })
     except Exception as exc:
         log.error("DASHBOARD CHAT ERROR: %s", exc, exc_info=True)
         return jsonify({"error": "Agent temporarily unavailable"}), 500
