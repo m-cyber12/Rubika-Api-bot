@@ -206,14 +206,23 @@ VOICE_ALLOWED_MIMES = {
 RUBIKA_CONTROL_FILE = os.environ.get(
     "RUBIKA_CONTROL_FILE", "rubika_control.json"
 ).strip()
+RUBIKA_CONFIRM_MODE = os.environ.get(
+    "RUBIKA_CONFIRM_MODE", "destructive_only"
+).strip().casefold()
+if RUBIKA_CONFIRM_MODE not in {"all_writes", "destructive_only", "delete_only", "none"}:
+    RUBIKA_CONFIRM_MODE = "destructive_only"
 RUBIKA_CONFIRM_TTL_SECONDS = int(
-    _float_env("RUBIKA_CONFIRM_TTL_SECONDS", 300, 60, 900)
+    _float_env("RUBIKA_CONFIRM_TTL_SECONDS", 900, 60, 3600)
 )
 MAX_RUBIKA_REFS = 200
 MAX_RUBIKA_MESSAGE_REFS = 500
 MAX_RUBIKA_PENDING_ACTIONS = 50
-RUBIKA_CHAT_REF_TTL_SECONDS = 86400
-RUBIKA_MESSAGE_REF_TTL_SECONDS = 7200
+RUBIKA_CHAT_REF_TTL_SECONDS = int(
+    _float_env("RUBIKA_CHAT_REF_TTL_SECONDS", 7 * 86400, 3600, 90 * 86400)
+)
+RUBIKA_MESSAGE_REF_TTL_SECONDS = int(
+    _float_env("RUBIKA_MESSAGE_REF_TTL_SECONDS", 24 * 3600, 1800, 30 * 86400)
+)
 
 try:
     SERVER_TZ = ZoneInfo(SERVER_TIMEZONE_NAME)
@@ -2409,6 +2418,16 @@ RUBIKA_WRITE_ACTIONS = {
 }
 
 
+def _requires_rubika_confirmation(action):
+    if RUBIKA_CONFIRM_MODE == "all_writes":
+        return True
+    if RUBIKA_CONFIRM_MODE == "destructive_only":
+        return action != "send_message"
+    if RUBIKA_CONFIRM_MODE == "delete_only":
+        return action == "delete_message"
+    return False
+
+
 def prepare_rubika_action(
     action: str,
     target_ref: str,
@@ -2469,6 +2488,17 @@ def prepare_rubika_action(
         "pin_message": f"پین پیام {message_ref} در {chat.get('name')}",
         "unpin_message": f"آن‌پین پیام {message_ref} در {chat.get('name')}",
     }[name]
+    if not _requires_rubika_confirmation(name):
+        _audit_tool("prepare_rubika_action", "auto_execute", f"code={code}; action={name}")
+        try:
+            result = _run_rubika_coroutine_sync(
+                _confirm_rubika_action_async(
+                    code, confirmer_guid="dashboard", trusted_dashboard=True
+                )
+            )
+            return f"{summary}\n{result}"
+        except Exception as exc:
+            return f"اجرای مستقیم ناموفق بود؛ عملیات {code} در صف تأیید باقی ماند: {exc}"
     _audit_tool("prepare_rubika_action", "pending", f"code={code}; action={name}")
     return (
         f"⚠️ عملیات فقط آماده شد و هنوز اجرا نشده است:\n{summary}\n"
@@ -2510,7 +2540,7 @@ def cancel_rubika_action(code: str) -> str:
     return f"عملیات روبیکا {clean_code} لغو شد."
 
 
-async def _confirm_rubika_action_async(code, confirmer_guid):
+async def _confirm_rubika_action_async(code, confirmer_guid, trusted_dashboard=False):
     clean_code = str(code or "").strip().casefold()
     with _rubika_control_lock:
         state = _load_rubika_control_locked()
@@ -2519,7 +2549,11 @@ async def _confirm_rubika_action_async(code, confirmer_guid):
         if not item or item.get("status") != "pending":
             _save_rubika_control_locked(state)
             return "کد منقضی، لغوشده یا نامعتبر است."
-        if item.get("requested_owner") and item["requested_owner"] != confirmer_guid:
+        if (
+            not trusted_dashboard
+            and item.get("requested_owner")
+            and item["requested_owner"] != confirmer_guid
+        ):
             return "این عملیات باید توسط همان مالک درخواست‌کننده تأیید شود."
         item["status"] = "executing"
         item["last_used"] = time.time()
@@ -3679,6 +3713,21 @@ body::before{
 .guide-box h4{color:var(--accent-1);font-size:14px;margin-bottom:8px;display:flex;align-items:center;gap:8px}
 .guide-box p{font-size:13px;color:var(--text-secondary);line-height:1.8}
 
+/* ───── Live JARVIS ───── */
+.live-card{text-align:center;min-height:620px;display:flex;flex-direction:column;align-items:center;gap:18px}
+.live-orb{width:180px;height:180px;border-radius:50%;position:relative;display:flex;align-items:center;justify-content:center;margin-top:20px;background:radial-gradient(circle,rgba(0,212,255,.28),rgba(124,58,237,.08) 55%,transparent 70%);color:var(--accent-1);font-size:44px;transition:.3s}
+.live-ring{position:absolute;border:2px solid var(--accent-1);border-radius:50%;inset:10px;opacity:.5}
+.ring-b{inset:25px;border-color:var(--accent-2);animation-direction:reverse}
+.live-orb.active .live-ring{animation:liveSpin 4s linear infinite}.live-orb.speaking{color:var(--accent-3);transform:scale(1.05)}
+.live-orb.thinking .live-ring{animation:livePulse .8s ease-in-out infinite alternate}
+@keyframes liveSpin{to{transform:rotate(360deg)}}@keyframes livePulse{to{transform:scale(1.15);opacity:1}}
+.live-state{font-size:18px;font-weight:900;letter-spacing:3px;color:var(--text-secondary)}
+#live-wave{width:100%;max-width:700px;height:100px;background:var(--bg-primary);border:1px solid var(--border);border-radius:12px}
+.live-controls{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
+.rubika-action-card{border:1px solid var(--border);border-radius:12px;padding:14px;background:var(--bg-primary);text-align:right}
+.rubika-action-card.pending{border-color:#f59e0b}.rubika-action-card.executed{border-color:var(--accent-4)}.rubika-action-card.failed{border-color:#ef4444}
+.rubika-action-meta{font-size:12px;color:var(--text-secondary);margin:6px 0}.rubika-action-buttons{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+
 /* ───── Responsive ───── */
 @media(max-width:768px){
   .sidebar{display:none}
@@ -3722,6 +3771,8 @@ body::before{
     <nav class="nav">
       <div class="nav-item active" data-tab="dashboard"><i class="fas fa-th-large"></i>داشبورد</div>
       <div class="nav-item" data-tab="chat"><i class="fas fa-comments"></i>چت با AI Agent</div>
+      <div class="nav-item" data-tab="live"><i class="fas fa-wave-square"></i>Live JARVIS</div>
+      <div class="nav-item" data-tab="rubika-control"><i class="fas fa-shield-alt"></i>کنترل روبیکا</div>
       <div class="nav-item" data-tab="send"><i class="fas fa-paper-plane"></i>ارسال پیام</div>
       <div class="nav-item" data-tab="kb"><i class="fas fa-brain"></i>دانش</div>
       <div class="nav-item" data-tab="pending"><i class="fas fa-clock"></i>سوالات</div>
@@ -3796,6 +3847,42 @@ body::before{
           </div>
           <div id="voice-status" style="font-size:12px;color:var(--text-secondary);margin-top:8px"></div>
         </div>
+      </div>
+    </div>
+
+    <!-- ───── Live JARVIS Panel ───── -->
+    <div id="panel-live" class="panel">
+      <div class="card live-card">
+        <div class="live-orb" id="live-orb">
+          <div class="live-ring ring-a"></div><div class="live-ring ring-b"></div>
+          <i class="fas fa-microphone"></i>
+        </div>
+        <div class="live-state" id="live-state">OFFLINE</div>
+        <canvas id="live-wave" width="700" height="100"></canvas>
+        <div class="guide-box"><h4><i class="fas fa-headset"></i> مکالمه زنده نوبتی</h4>
+          <p id="live-transcript">جلسه را شروع کنید؛ بعد از تشخیص سکوت، جمله خودکار ارسال می‌شود.</p>
+          <p id="live-answer" style="color:var(--text-primary);margin-top:8px"></p>
+        </div>
+        <div class="live-controls">
+          <button class="btn btn-success" id="live-start"><i class="fas fa-play"></i> شروع جلسه</button>
+          <button class="btn btn-danger" id="live-stop" disabled><i class="fas fa-stop"></i> پایان</button>
+          <button class="btn btn-primary" id="live-mute" disabled><i class="fas fa-microphone-slash"></i> بی‌صدا</button>
+          <button class="header-btn" id="live-interrupt" disabled><i class="fas fa-hand-paper"></i> قطع پاسخ</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ───── Rubika Control Panel ───── -->
+    <div id="panel-rubika-control" class="panel">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="fas fa-shield-alt"></i> عملیات امن روبیکا</div>
+          <button class="header-btn" onclick="loadRubikaControl()"><i class="fas fa-sync-alt"></i> بروزرسانی</button>
+        </div>
+        <div class="guide-box"><h4><i class="fas fa-lock"></i> حالت تأیید</h4>
+          <p id="rubika-control-mode">در حال دریافت وضعیت...</p>
+        </div>
+        <div id="rubika-actions-list" class="item-list" style="margin-top:16px"></div>
       </div>
     </div>
 
@@ -3883,7 +3970,7 @@ function showToast(msg,isError){
 }
 
 // ───── Tab Switching ─────
-const titles={dashboard:'داشبورد',chat:'چت با AI Agent',send:'ارسال پیام',kb:'مدیریت دانش',pending:'سوالات',logs:'لاگ',config:'تنظیمات'};
+const titles={dashboard:'داشبورد',chat:'چت با AI Agent',live:'Live JARVIS','rubika-control':'کنترل روبیکا',send:'ارسال پیام',kb:'مدیریت دانش',pending:'سوالات',logs:'لاگ',config:'تنظیمات'};
 function switchTab(name){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
@@ -3894,6 +3981,7 @@ function switchTab(name){
   if(name==='pending') loadPending();
   if(name==='logs') loadLogs();
   if(name==='config') loadConfig();
+  if(name==='rubika-control') loadRubikaControl();
 }
 document.querySelectorAll('.nav-item').forEach(n=>n.onclick=()=>switchTab(n.dataset.tab));
 
@@ -3987,6 +4075,105 @@ async function toggleVoiceRecording(){
   }catch(e){setVoiceStatus('اجازه میکروفن داده نشد یا خطایی رخ داد.',true);}
 }
 document.getElementById('btn-voice').onclick=toggleVoiceRecording;
+
+// ───── Rubika Safe Control ─────
+const rubikaActionLabels={send_message:'ارسال پیام',edit_message:'ویرایش پیام',delete_message:'حذف پیام',pin_message:'پین پیام',unpin_message:'آن‌پین پیام'};
+async function rubikaActionRequest(code,action){
+  try{
+    const r=await fetch('/api/rubika-control/actions/'+encodeURIComponent(code)+'/'+action,{method:'POST'});
+    const d=await r.json();showToast(d.result||d.error||'انجام شد',!d.ok);await loadRubikaControl();
+  }catch(e){showToast('خطای شبکه',true);}
+}
+async function loadRubikaControl(){
+  const list=document.getElementById('rubika-actions-list'),mode=document.getElementById('rubika-control-mode');
+  if(!list||!mode)return;
+  try{
+    const r=await fetch('/api/rubika-control/actions'),d=await r.json();
+    const modeNames={all_writes:'تأیید همه عملیات',destructive_only:'ارسال مستقیم؛ سایر عملیات نیازمند تأیید',delete_only:'فقط حذف نیازمند تأیید',none:'بدون تأیید'};
+    mode.textContent=(modeNames[d.confirmation_mode]||d.confirmation_mode)+' — اعتبار: '+Math.round((d.confirmation_ttl_seconds||0)/60)+' دقیقه';
+    list.innerHTML='';const actions=d.actions||[];
+    if(!actions.length){list.innerHTML='<div class="empty-state"><i class="fas fa-check-circle"></i><p>عملیاتی ثبت نشده است</p></div>';return;}
+    for(const item of actions){
+      const card=document.createElement('div');card.className='rubika-action-card '+(item.status||'');
+      const title=document.createElement('b');title.textContent=(rubikaActionLabels[item.action]||item.action)+' — '+(item.target||item.target_ref||'');card.appendChild(title);
+      const meta=document.createElement('div');meta.className='rubika-action-meta';meta.textContent='کد: '+item.code+' | وضعیت: '+item.status+(item.expires_in_seconds?' | '+item.expires_in_seconds+' ثانیه باقی‌مانده':'');card.appendChild(meta);
+      if(item.text){const text=document.createElement('p');text.textContent=item.text;card.appendChild(text);}
+      if(item.result){const result=document.createElement('p');result.textContent='نتیجه: '+item.result;card.appendChild(result);}
+      if(item.status==='pending'){
+        const buttons=document.createElement('div');buttons.className='rubika-action-buttons';
+        const yes=document.createElement('button');yes.className='btn btn-success btn-sm';yes.innerHTML='<i class="fas fa-check"></i> تأیید';yes.onclick=()=>rubikaActionRequest(item.code,'confirm');
+        const no=document.createElement('button');no.className='btn btn-danger btn-sm';no.innerHTML='<i class="fas fa-times"></i> لغو';no.onclick=()=>rubikaActionRequest(item.code,'cancel');
+        buttons.appendChild(yes);buttons.appendChild(no);card.appendChild(buttons);
+      }
+      list.appendChild(card);
+    }
+  }catch(e){list.innerHTML='<div class="empty-state"><p>خطا در دریافت عملیات</p></div>';}
+}
+
+// ───── Live JARVIS Turn Mode ─────
+let liveSession=false,liveMuted=false,liveBusy=false,liveStream=null,liveCtx=null,liveAnalyser=null,liveSource=null,liveRaf=0,liveRecorder=null,liveChunks=[],liveVoiceSeen=false,liveLastVoice=0,liveStartedAt=0,liveNoise=.008,liveAudio=null,liveAbort=null;
+function setLiveState(state){
+  const label=document.getElementById('live-state'),orb=document.getElementById('live-orb');if(!label||!orb)return;
+  label.textContent=state;orb.className='live-orb '+(state==='LISTENING'?'active':state==='THINKING'?'thinking':state==='SPEAKING'?'speaking':'');
+  label.style.color=state==='LISTENING'?'var(--accent-4)':state==='THINKING'?'#f59e0b':state==='SPEAKING'?'var(--accent-3)':'var(--text-secondary)';
+}
+function liveMime(){for(const m of ['audio/webm;codecs=opus','audio/ogg;codecs=opus','audio/webm'])if(MediaRecorder.isTypeSupported(m))return m;return '';}
+function startLiveUtterance(){
+  if(!liveSession||liveMuted||liveBusy||liveRecorder?.state==='recording')return;
+  liveChunks=[];liveVoiceSeen=false;liveStartedAt=performance.now();liveLastVoice=liveStartedAt;
+  liveRecorder=new MediaRecorder(liveStream,liveMime()?{mimeType:liveMime()}:{});
+  liveRecorder.ondataavailable=e=>{if(e.data?.size)liveChunks.push(e.data);};
+  liveRecorder.onstop=()=>{const blob=new Blob(liveChunks,{type:liveRecorder.mimeType||'audio/webm'});if(liveSession&&blob.size>400)sendLiveTurn(blob);};
+  liveRecorder.start();
+}
+function stopLiveUtterance(){if(liveRecorder?.state==='recording')liveRecorder.stop();}
+function drawLiveWave(values,rms,threshold){
+  const canvas=document.getElementById('live-wave');if(!canvas)return;const c=canvas.getContext('2d'),w=canvas.width,h=canvas.height;
+  c.clearRect(0,0,w,h);c.fillStyle='#090912';c.fillRect(0,0,w,h);c.strokeStyle=rms>threshold?'#34d399':'#00d4ff';c.lineWidth=2;c.beginPath();
+  const step=Math.max(1,Math.floor(values.length/w));for(let x=0;x<w;x++){const y=(values[x*step]/255)*h;if(x===0)c.moveTo(x,y);else c.lineTo(x,y);}c.stroke();
+}
+function liveVadLoop(){
+  if(!liveSession||!liveAnalyser)return;const values=new Uint8Array(liveAnalyser.fftSize);liveAnalyser.getByteTimeDomainData(values);
+  let sum=0;for(const v of values){const n=(v-128)/128;sum+=n*n;}const rms=Math.sqrt(sum/values.length);
+  if(!liveRecorder||liveRecorder.state!=='recording')liveNoise=liveNoise*.97+rms*.03;const threshold=Math.max(.018,liveNoise*2.6);
+  drawLiveWave(values,rms,threshold);const now=performance.now();
+  if(!liveMuted&&!liveBusy&&rms>threshold){if(!liveRecorder||liveRecorder.state!=='recording')startLiveUtterance();liveVoiceSeen=true;liveLastVoice=now;}
+  if(liveRecorder?.state==='recording'){
+    if(rms>threshold){liveVoiceSeen=true;liveLastVoice=now;}
+    if((liveVoiceSeen&&now-liveLastVoice>1200)||now-liveStartedAt>30000)stopLiveUtterance();
+  }
+  liveRaf=requestAnimationFrame(liveVadLoop);
+}
+function finishLiveTurn(){liveBusy=false;if(liveSession)setLiveState(liveMuted?'MUTED':'LISTENING');}
+async function sendLiveTurn(blob){
+  liveBusy=true;setLiveState('THINKING');const transcript=document.getElementById('live-transcript'),answer=document.getElementById('live-answer');
+  liveAbort=new AbortController();
+  try{
+    const form=new FormData(),ext=blob.type.includes('ogg')?'ogg':'webm';form.append('audio',blob,'live_turn.'+ext);
+    const r=await fetch('/api/voice/chat',{method:'POST',body:form,signal:liveAbort.signal}),d=await r.json();if(!r.ok)throw new Error(d.error||'خطای Live');
+    transcript.textContent='شما: '+d.transcript;answer.textContent='JARVIS: '+d.reply;
+    if(d.audio_base64){
+      const binary=atob(d.audio_base64),bytes=new Uint8Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+      liveAudio=new Audio(URL.createObjectURL(new Blob([bytes],{type:d.audio_mime||'audio/mpeg'})));setLiveState('SPEAKING');
+      liveAudio.onended=finishLiveTurn;liveAudio.onerror=finishLiveTurn;await liveAudio.play().catch(()=>finishLiveTurn());
+    }else finishLiveTurn();
+  }catch(e){if(e.name!=='AbortError')answer.textContent='خطا: '+e.message;finishLiveTurn();}
+}
+async function startLiveSession(){
+  if(liveSession)return;if(!navigator.mediaDevices?.getUserMedia||typeof MediaRecorder==='undefined'){showToast('مرورگر از Live Voice پشتیبانی نمی‌کند',true);return;}
+  try{
+    liveStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+    liveCtx=new (window.AudioContext||window.webkitAudioContext)();liveAnalyser=liveCtx.createAnalyser();liveAnalyser.fftSize=1024;liveSource=liveCtx.createMediaStreamSource(liveStream);liveSource.connect(liveAnalyser);
+    liveSession=true;liveMuted=false;liveBusy=false;document.getElementById('live-start').disabled=true;document.getElementById('live-stop').disabled=false;document.getElementById('live-mute').disabled=false;document.getElementById('live-interrupt').disabled=false;setLiveState('LISTENING');liveVadLoop();
+  }catch(e){showToast('دسترسی میکروفن ممکن نشد',true);}
+}
+function stopLiveSession(){
+  liveSession=false;liveAbort?.abort();liveAudio?.pause();stopLiveUtterance();cancelAnimationFrame(liveRaf);liveStream?.getTracks().forEach(t=>t.stop());liveCtx?.close();liveStream=liveCtx=liveAnalyser=liveSource=liveAudio=liveAbort=null;
+  document.getElementById('live-start').disabled=false;document.getElementById('live-stop').disabled=true;document.getElementById('live-mute').disabled=true;document.getElementById('live-interrupt').disabled=true;setLiveState('OFFLINE');
+}
+function toggleLiveMute(){liveMuted=!liveMuted;document.getElementById('live-mute').innerHTML=liveMuted?'<i class="fas fa-microphone"></i> وصل صدا':'<i class="fas fa-microphone-slash"></i> بی‌صدا';setLiveState(liveMuted?'MUTED':'LISTENING');}
+function interruptLive(){liveAbort?.abort();if(liveAudio){liveAudio.pause();liveAudio.currentTime=0;}finishLiveTurn();}
+document.getElementById('live-start').onclick=startLiveSession;document.getElementById('live-stop').onclick=stopLiveSession;document.getElementById('live-mute').onclick=toggleLiveMute;document.getElementById('live-interrupt').onclick=interruptLive;
 
 // ───── Send Message ─────
 async function sendMsg(){
@@ -4146,7 +4333,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase3-voice-v1.3-safe-rubika-control",
+        "version": "phase3-voice-v1.4-live-dashboard-control",
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -4468,6 +4655,65 @@ def api_answer():
 def api_logs():
     with _lock_logs:
         return jsonify({"logs": list(reversed(chat_logs[-100:]))})
+
+
+def _rubika_action_dashboard_items():
+    with _rubika_control_lock:
+        state = _load_rubika_control_locked()
+        _cleanup_rubika_control_locked(state)
+        items = []
+        for item in state["pending"].values():
+            chat = state["chat_refs"].get(item.get("target_ref"), {})
+            items.append({
+                "code": item.get("code"),
+                "action": item.get("action"),
+                "status": item.get("status"),
+                "target": chat.get("name", ""),
+                "target_ref": item.get("target_ref"),
+                "message_ref": item.get("message_ref", ""),
+                "text": str(item.get("text") or "")[:500],
+                "actor": str(item.get("actor") or "")[:120],
+                "created_at": item.get("created_at"),
+                "expires_at": item.get("expires_at"),
+                "expires_in_seconds": max(0, int(float(item.get("expires_at", 0)) - time.time())),
+                "result": str(item.get("result") or "")[:500],
+            })
+        _save_rubika_control_locked(state)
+    items.sort(key=lambda row: float(row.get("created_at") or 0), reverse=True)
+    return items[:50]
+
+
+@app.route("/api/rubika-control/actions")
+def rubika_control_actions():
+    return jsonify({
+        "confirmation_mode": RUBIKA_CONFIRM_MODE,
+        "confirmation_ttl_seconds": RUBIKA_CONFIRM_TTL_SECONDS,
+        "actions": _rubika_action_dashboard_items(),
+    })
+
+
+@app.route("/api/rubika-control/actions/<code>/confirm", methods=["POST"])
+def rubika_control_confirm(code):
+    if not re.fullmatch(r"[0-9a-fA-F]{8}", code):
+        return jsonify({"error": "Invalid action code"}), 400
+    try:
+        result = _run_rubika_coroutine_sync(
+            _confirm_rubika_action_async(
+                code.casefold(), confirmer_guid="dashboard", trusted_dashboard=True
+            )
+        )
+    except Exception as exc:
+        log.error("DASHBOARD RUBIKA CONFIRM ERROR: %s", exc)
+        return jsonify({"error": "Rubika confirmation failed"}), 500
+    return jsonify({"ok": result.startswith("✅"), "result": result})
+
+
+@app.route("/api/rubika-control/actions/<code>/cancel", methods=["POST"])
+def rubika_control_cancel(code):
+    if not re.fullmatch(r"[0-9a-fA-F]{8}", code):
+        return jsonify({"error": "Invalid action code"}), 400
+    result = cancel_rubika_action(code.casefold())
+    return jsonify({"ok": "لغو شد" in result, "result": result})
 
 
 @app.route("/api/config")
