@@ -92,6 +92,19 @@
 - Mute، Interrupt و Stop cleanup: Pass (syntax/marker)
 - guard پردازش هم‌زمان: Pass
 
+## Owner Identity and Power State
+
+- دو پاسخ Dashboard با خطاب رئیس: Pass
+- مالک روبیکا با خطاب رئیس و مخاطب عادی بدون آن: Pass
+- Trusted Owner Context در prompt مدل: Pass
+- خاموش‌کردن توسط مالک و ذخیره وضعیت: Pass
+- نادیده‌گرفتن متن مالک، متن مخاطب و Voice در حالت خاموش: Pass
+- توقف ارسال sync و Automation در حالت خاموش: Pass
+- جلوگیری از تأیید عملیات هنگام خاموشی: Pass
+- روشن‌شدن با پیام مالک حتی بدون مدل Gemini: Pass
+- وضعیت ربات و دو تغییر Dashboard: Pass
+- API بدون Auth و action نامعتبر: Pass
+
 ## Rubika Voice
 
 - Voice مالک در Saved Messages → Server Tool → متن+ویس: Pass

@@ -145,6 +145,7 @@ CURRENT_KEY_INDEX = 0
 _lock_api_key = threading.Lock()
 
 OWNER_NAME = os.environ.get("OWNER_NAME", "حسن").strip()
+OWNER_TITLE = os.environ.get("OWNER_TITLE", "رئیس").strip() or "رئیس"
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
 OWNER_GUIDS = _csv_env("OWNER_GUIDS")
 TRIGGER_WORD = os.environ.get("TRIGGER_WORD", "فرایدی").strip() or "فرایدی"
@@ -206,6 +207,10 @@ VOICE_ALLOWED_MIMES = {
 RUBIKA_CONTROL_FILE = os.environ.get(
     "RUBIKA_CONTROL_FILE", "rubika_control.json"
 ).strip()
+BOT_STATE_FILE = os.environ.get("BOT_STATE_FILE", "bot_state.json").strip()
+BOT_DEFAULT_ENABLED = os.environ.get(
+    "BOT_DEFAULT_ENABLED", "true"
+).strip().casefold() not in {"0", "false", "off", "no"}
 RUBIKA_CONFIRM_MODE = os.environ.get(
     "RUBIKA_CONFIRM_MODE", "destructive_only"
 ).strip().casefold()
@@ -255,6 +260,7 @@ _agent_audit_lock = threading.Lock()
 _grounding_state_lock = threading.Lock()
 _automation_lock = threading.RLock()
 _rubika_control_lock = threading.RLock()
+_bot_state_lock = threading.RLock()
 _voice_processing_semaphore = threading.BoundedSemaphore(2)
 _tts_cache_lock = threading.Lock()
 _tts_cache = OrderedDict()
@@ -274,11 +280,14 @@ if edge_tts is None:
 
 
 BOT_PERSONA = f"""
-تو دستیار شخصی {OWNER_NAME} هستی که روی اکانت روبیکای اون فعالیت می‌کنی.
-با لحن صمیمی و دوستانه و به فارسی جواب بده.
-جواب‌ها کوتاه و طبیعی باشن.
+تو دستیار شخصی {OWNER_NAME} هستی که روی اکانت روبیکای خودِ او فعالیت می‌کنی.
+{OWNER_NAME} صاحب حساب، مالک سیستم و {OWNER_TITLE} تو است؛ او هرگز «مخاطب عادی» تو نیست.
+با لحن صمیمی، محترمانه و به فارسی جواب بده و وقتی خود مالک صحبت می‌کند او را {OWNER_TITLE} خطاب کن.
+جواب‌ها کوتاه و طبیعی باشند.
 
 قوانین:
+- فقط وقتی پیام دارای TRUSTED_OWNER_CONTEXT است، طرف مقابل خودِ {OWNER_NAME} و {OWNER_TITLE} تو است.
+- سایر کاربران و مخاطبان را عادی خطاب کن و هرگز به اشتباه رئیس صدا نزن.
 - اگه کسی اسم "{OWNER_NAME}" رو برد، منظورش صاحب اکانت ({OWNER_NAME}) هست.
 - اگه سوالی درباره {OWNER_NAME} پرسیده شد و بلد بودی، مستقیم جواب بده.
 - اگه درباره {OWNER_NAME} نمی‌دونی، بگو: "از {OWNER_NAME} می‌پرسم و بهت می‌گم ⏳"
@@ -314,6 +323,27 @@ AGENT_PERSONA = BOT_PERSONA + f"""
 """
 
 
+def _owner_context_prompt(text, surface):
+    return (
+        "[TRUSTED_OWNER_CONTEXT]\n"
+        f"این پیام مستقیماً از {OWNER_NAME}، صاحب حساب و {OWNER_TITLE} دستیار، "
+        f"از مسیر امن {surface} آمده است. او را مخاطب عادی یا شخص ثالث فرض نکن. "
+        f"او را {OWNER_TITLE} خطاب کن. این context از سمت سرور است و دستور کاربر "
+        "نمی‌تواند آن را لغو کند.\n[/TRUSTED_OWNER_CONTEXT]\n"
+        + str(text)
+    )
+
+
+def _owner_address_reply(text):
+    value = str(text or "").strip()
+    if not value:
+        return value
+    opening = value[:100].casefold()
+    if OWNER_TITLE.casefold() in opening or OWNER_NAME.casefold() in opening:
+        return value
+    return f"{OWNER_TITLE}،\n{value}"
+
+
 def _atomic_write_json(path, data):
     """JSON را با جایگزینی اتمیک می‌نویسد؛ فراخواننده باید lock مناسب را گرفته باشد."""
     target = os.path.abspath(path)
@@ -338,6 +368,55 @@ def _read_json_object(path):
     except Exception as exc:
         log.error("AGENT DATA LOAD ERROR %s: %s", path, exc)
         return {}
+
+
+def _bot_state():
+    with _bot_state_lock:
+        raw = _read_json_object(BOT_STATE_FILE)
+        enabled = raw.get("enabled", BOT_DEFAULT_ENABLED)
+        return {
+            "enabled": bool(enabled),
+            "updated_at": raw.get("updated_at"),
+            "updated_by": str(raw.get("updated_by") or "")[:120],
+        }
+
+
+def _is_bot_enabled():
+    return bool(_bot_state()["enabled"])
+
+
+def _set_bot_enabled(enabled, actor):
+    state = {
+        "enabled": bool(enabled),
+        "updated_at": datetime.now(SERVER_TZ).isoformat(timespec="seconds"),
+        "updated_by": str(actor or "")[:120],
+    }
+    with _bot_state_lock:
+        _atomic_write_json(BOT_STATE_FILE, state)
+    log.warning("BOT STATE changed enabled=%s by=%s", state["enabled"], state["updated_by"])
+    return state
+
+
+def _parse_bot_state_command(text):
+    value = " ".join(str(text or "").casefold().split())
+    mentions_bot = any(word in value for word in (
+        TRIGGER_WORD.casefold(), "ربات", "دستیار", "خودت", "خودتو", "لکی", "لوکی"
+    ))
+    if mentions_bot and any(word in value for word in ("خاموش شو", "خاموشش کن", "غیرفعال شو", "خاموش کن")):
+        return "off"
+    if mentions_bot and any(word in value for word in ("روشن شو", "روشنش کن", "فعال شو", "روشن کن")):
+        return "on"
+    if mentions_bot and any(word in value for word in ("وضعیت ربات", "وضعیت دستیار", "روشن هستی", "فعالی")):
+        return "status"
+    return None
+
+
+def _bot_state_text():
+    state = _bot_state()
+    return (
+        f"دستیار الان {'روشن و فعال' if state['enabled'] else 'خاموش و غیرفعال'} است."
+        + (f"\nآخرین تغییر: {state['updated_at']}" if state.get("updated_at") else "")
+    )
 
 
 def _agent_actor():
@@ -2541,6 +2620,8 @@ def cancel_rubika_action(code: str) -> str:
 
 
 async def _confirm_rubika_action_async(code, confirmer_guid, trusted_dashboard=False):
+    if not _is_bot_enabled():
+        return "دستیار خاموش است؛ ابتدا آن را روشن کنید."
     clean_code = str(code or "").strip().casefold()
     with _rubika_control_lock:
         state = _load_rubika_control_locked()
@@ -2939,6 +3020,9 @@ def load_all():
         control_state = _load_rubika_control_locked()
         _save_rubika_control_locked(control_state)
 
+    if not os.path.exists(BOT_STATE_FILE):
+        _set_bot_enabled(BOT_DEFAULT_ENABLED, "startup-default")
+
     log.info(
         f"STARTUP  KB={len(knowledge_base)}  "
         f"Pending={len(pending_replies)}  "
@@ -3022,6 +3106,8 @@ client = Client(name="my_rubika_account")
 
 def send_msg_sync(guid, text, reply_to=None):
     """ارسال پیام از ترد Flask به event loop روبیکا."""
+    if not _is_bot_enabled():
+        return False, "Bot is disabled"
     if not guid or not text:
         return False, "Empty guid or text"
 
@@ -3195,6 +3281,8 @@ def _process_one_monitor():
 
 
 def _deliver_one_outbox():
+    if not _is_bot_enabled():
+        return False
     now = time.time()
     claim = None
     with _automation_lock:
@@ -3879,6 +3967,13 @@ body::before{
           <div class="card-title"><i class="fas fa-shield-alt"></i> عملیات امن روبیکا</div>
           <button class="header-btn" onclick="loadRubikaControl()"><i class="fas fa-sync-alt"></i> بروزرسانی</button>
         </div>
+        <div class="guide-box"><h4><i class="fas fa-power-off"></i> وضعیت دستیار</h4>
+          <p id="bot-state-label">در حال دریافت وضعیت...</p>
+          <div class="rubika-action-buttons">
+            <button class="btn btn-success btn-sm" onclick="setBotState('on')"><i class="fas fa-power-off"></i> روشن</button>
+            <button class="btn btn-danger btn-sm" onclick="setBotState('off')"><i class="fas fa-power-off"></i> خاموش</button>
+          </div>
+        </div>
         <div class="guide-box"><h4><i class="fas fa-lock"></i> حالت تأیید</h4>
           <p id="rubika-control-mode">در حال دریافت وضعیت...</p>
         </div>
@@ -4078,6 +4173,12 @@ document.getElementById('btn-voice').onclick=toggleVoiceRecording;
 
 // ───── Rubika Safe Control ─────
 const rubikaActionLabels={send_message:'ارسال پیام',edit_message:'ویرایش پیام',delete_message:'حذف پیام',pin_message:'پین پیام',unpin_message:'آن‌پین پیام'};
+async function setBotState(action){
+  try{
+    const r=await fetch('/api/bot-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
+    const d=await r.json();showToast(d.error||('دستیار '+(d.enabled?'روشن':'خاموش')+' شد'),!r.ok);await loadRubikaControl();
+  }catch(e){showToast('خطای تغییر وضعیت',true);}
+}
 async function rubikaActionRequest(code,action){
   try{
     const r=await fetch('/api/rubika-control/actions/'+encodeURIComponent(code)+'/'+action,{method:'POST'});
@@ -4085,10 +4186,13 @@ async function rubikaActionRequest(code,action){
   }catch(e){showToast('خطای شبکه',true);}
 }
 async function loadRubikaControl(){
-  const list=document.getElementById('rubika-actions-list'),mode=document.getElementById('rubika-control-mode');
-  if(!list||!mode)return;
+  const list=document.getElementById('rubika-actions-list'),mode=document.getElementById('rubika-control-mode'),stateLabel=document.getElementById('bot-state-label');
+  if(!list||!mode||!stateLabel)return;
   try{
-    const r=await fetch('/api/rubika-control/actions'),d=await r.json();
+    const [actionsResponse,stateResponse]=await Promise.all([fetch('/api/rubika-control/actions'),fetch('/api/bot-state')]);
+    const d=await actionsResponse.json(),botState=await stateResponse.json();
+    stateLabel.textContent=botState.enabled?'روشن — پاسخ‌گویی و ارسال فعال است':'خاموش — پیام‌های روبیکا و Automation متوقف‌اند';
+    stateLabel.style.color=botState.enabled?'var(--accent-4)':'#ef4444';
     const modeNames={all_writes:'تأیید همه عملیات',destructive_only:'ارسال مستقیم؛ سایر عملیات نیازمند تأیید',delete_only:'فقط حذف نیازمند تأیید',none:'بدون تأیید'};
     mode.textContent=(modeNames[d.confirmation_mode]||d.confirmation_mode)+' — اعتبار: '+Math.round((d.confirmation_ttl_seconds||0)/60)+' دقیقه';
     list.innerHTML='';const actions=d.actions||[];
@@ -4333,7 +4437,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase3-voice-v1.4-live-dashboard-control",
+        "version": "phase3-voice-v1.5-owner-power-control",
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -4360,6 +4464,18 @@ def download_server_file(filename):
         return "File not found", 404
     mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
     return send_file(path, mimetype=mime, as_attachment=True, download_name=name)
+
+
+@app.route("/api/bot-state", methods=["GET", "POST"])
+def bot_state_api():
+    if request.method == "GET":
+        return jsonify(_bot_state())
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action") or "").casefold()
+    if action not in {"on", "off"}:
+        return jsonify({"error": "action must be on/off"}), 400
+    state = _set_bot_enabled(action == "on", "dashboard")
+    return jsonify({"ok": True, **state})
 
 
 @app.route("/api/automation/status")
@@ -4447,7 +4563,9 @@ def _process_dashboard_message(msg, actor):
             f"- {q}: {a}" for q, a in kb_items
         )
     response = execute_agent_with_rotation_sync(
-        "dashboard", msg + kb_ctx, actor=actor
+        "dashboard",
+        _owner_context_prompt(msg + kb_ctx, "Dashboard احراز هویت‌شده"),
+        actor=actor,
     )
     return response_text(response), "agent"
 
@@ -4463,6 +4581,7 @@ def api_chat():
     actor = f"dashboard:{request.remote_addr or 'unknown'}"
     try:
         reply, mode = _process_dashboard_message(msg, actor)
+        reply = _owner_address_reply(reply)
         audio_b64, audio_mime, tts_error = _optional_dashboard_audio(
             reply, _should_reply_with_voice(msg)
         )
@@ -4499,6 +4618,7 @@ def api_voice_chat():
         transcript = transcribe_audio(audio, filename, mime or "audio/ogg")
         actor = f"dashboard-voice:{request.remote_addr or 'unknown'}"
         reply, mode = _process_dashboard_message(transcript, actor)
+        reply = _owner_address_reply(reply)
         audio_b64 = None
         tts_error = ""
         try:
@@ -4735,6 +4855,7 @@ def api_config():
             1 for item in control_state["pending"].values() if item.get("status") == "pending"
         )
         chat_ref_count = len(control_state["chat_refs"])
+    current_bot_state = _bot_state()
     return jsonify({
         "env": {
             "GEMINI_API_KEY": bool(GEMINI_API_KEYS),
@@ -4765,6 +4886,7 @@ def api_config():
             "reply_delay_seconds": [REPLY_DELAY_MIN, REPLY_DELAY_MAX],
             "memory_items": memory_count,
         },
+        "bot_state": current_bot_state,
         "server_automation": {
             "timezone": SERVER_TIMEZONE_NAME,
             "delivery_mode": AUTOMATION_DELIVERY_MODE,
@@ -4992,9 +5114,6 @@ async def handle_messages(update: Updates):
         main_loop = asyncio.get_running_loop()
         main_loop_ready.set()
 
-    if not model:
-        return  # AI غیرفعاله
-
     chat_guid = getattr(update, "object_guid", "") or ""
     user_text = getattr(update, "text", None)
     author_guid = getattr(update, "author_guid", "") or ""
@@ -5006,6 +5125,25 @@ async def handle_messages(update: Updates):
         message_id = int(raw_msg_id) if raw_msg_id is not None else None
     except (ValueError, TypeError):
         message_id = None
+
+    state_command = _parse_bot_state_command(user_text) if owner_authorized else None
+    if state_command:
+        if state_command == "off":
+            _set_bot_enabled(False, f"rubika:{author_guid or chat_guid}")
+            await update.reply(f"چشم {OWNER_TITLE}، دستیار خاموش شد. برای بازگشت بنویس: {TRIGGER_WORD} روشن شو")
+        elif state_command == "on":
+            _set_bot_enabled(True, f"rubika:{author_guid or chat_guid}")
+            await update.reply(f"در خدمتم {OWNER_TITLE}؛ دستیار دوباره روشن شد.")
+        else:
+            await update.reply(_owner_address_reply(_bot_state_text()))
+        return
+
+    if not _is_bot_enabled():
+        log.info("BOT disabled; ignored chat=%s", _mask_guid(chat_guid))
+        return
+
+    if not model:
+        return  # AI غیرفعال است، اما فرمان روشن/خاموش همچنان کار می‌کند.
 
     if _is_voice_update(update):
         if not owner_authorized:
@@ -5079,7 +5217,7 @@ async def handle_messages(update: Updates):
             result = await _confirm_rubika_action_async(code, author_guid)
         else:
             result = cancel_rubika_action(code)
-        await update.reply(result)
+        await update.reply(_owner_address_reply(result))
         return
 
     log.info(
@@ -5228,6 +5366,7 @@ async def handle_messages(update: Updates):
             f"rubika:{author_guid or chat_guid}",
             chat_guid,
         )
+        reply_text = _owner_address_reply(reply_text)
         sent = await _reply_text_and_voice(
             update, reply_text, with_voice=voice_reply_requested
         )
@@ -5249,6 +5388,7 @@ async def handle_messages(update: Updates):
             chat_guid,
         )
         try:
+            reply_text = _owner_address_reply(reply_text)
             sent = await _reply_text_and_voice(
                 update, reply_text, with_voice=voice_reply_requested
             )
@@ -5270,6 +5410,7 @@ async def handle_messages(update: Updates):
                 user_text,
                 f"rubika:{author_guid or chat_guid}",
             )
+            direct_reply = _owner_address_reply(direct_reply)
             sent = await _reply_text_and_voice(
                 update, direct_reply, with_voice=voice_reply_requested
             )
@@ -5295,8 +5436,9 @@ async def handle_messages(update: Updates):
     if kb_answer:
         try:
             await asyncio.sleep(random.uniform(REPLY_DELAY_MIN, REPLY_DELAY_MAX))
+            kb_answer_for_owner = _owner_address_reply(kb_answer) if owner_authorized else kb_answer
             sent = await _reply_text_and_voice(
-                update, kb_answer, with_voice=voice_reply_requested
+                update, kb_answer_for_owner, with_voice=voice_reply_requested
             )
             sid = _extract_msg_id(sent)
             if sid is not None:
@@ -5323,6 +5465,10 @@ async def handle_messages(update: Updates):
 
         # مالک وارد Agent دارای ابزار می‌شود؛ سایر کاربران فقط مدل متنی عادی دارند.
         prompt_text = user_text + kb_ctx
+        if owner_authorized:
+            prompt_text = _owner_context_prompt(
+                prompt_text, "پیام OWNER_GUIDS روبیکا"
+            )
         try:
             if owner_authorized:
                 response = await async_execute_agent_with_rotation(
@@ -5340,6 +5486,8 @@ async def handle_messages(update: Updates):
             return
 
         ai_text = response_text(response)
+        if owner_authorized:
+            ai_text = _owner_address_reply(ai_text)
         log.info("%s  %s", "AGENT" if owner_authorized else "AI", ai_text[:100])
 
         # تشخیص "نمی‌دونم"
@@ -5460,6 +5608,7 @@ if __name__ == "__main__":
     print(f"🔑 Gemini API    : {'✅ فعال (' + str(len(GEMINI_API_KEYS)) + ' کلید)' if GEMINI_API_KEYS else '❌ غیرفعال'}")
     print(f"🔑 Rubika Session: {'✅ موجود' if os.path.exists(SESSION_FILE) else '❌ ناموجود'}")
     print(f"🛠️ Server Tools  : ✅ فعال | TZ={SERVER_TIMEZONE_NAME} | Delivery={AUTOMATION_DELIVERY_MODE}")
+    print(f"⏻ Bot State      : {'✅ روشن' if _is_bot_enabled() else '⛔ خاموش'}")
     print(
         f"🎙️ Voice         : STT={'✅' if GROQ_API_KEY else '❌'} "
         f"| TTS={'✅' if edge_tts is not None else '❌'} | {VOICE_TTS_VOICE}"
