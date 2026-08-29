@@ -3423,23 +3423,95 @@ def _is_tracked_bot_message(chat_guid, text="", message_id=None):
 
 async def _send_rubika_message(guid, text, reply_to=None):
     """Send a message and register it before/after the server call for loop safety."""
+    clean_reply_to = norm_id(reply_to)
+    _diag_record(
+        "rubika_outgoing_start",
+        kind="client.send_message",
+        chat=_mask_guid(guid),
+        text_chars=len(str(text or "")),
+        reply_to=clean_reply_to or "-",
+    )
+    log.info(
+        "RUBIKA OUT START kind=send chat=%s chars=%s reply_to=%s",
+        _mask_guid(guid), len(str(text or "")), clean_reply_to or "-",
+    )
     _mark_bot_outgoing(guid, text)
-    if reply_to:
-        result = await client.send_message(
-            guid, text, reply_to_message_id=norm_id(reply_to)
+    try:
+        if clean_reply_to:
+            result = await client.send_message(
+                guid, text, reply_to_message_id=clean_reply_to
+            )
+        else:
+            result = await client.send_message(guid, text)
+    except Exception as exc:
+        _diag_record(
+            "rubika_outgoing_error",
+            kind="client.send_message",
+            chat=_mask_guid(guid),
+            exception=type(exc).__name__,
+            error=exc,
         )
-    else:
-        result = await client.send_message(guid, text)
-    _mark_bot_outgoing(guid, text, _extract_msg_id(result))
+        log.error(
+            "RUBIKA OUT ERROR kind=send chat=%s exc=%s: %s",
+            _mask_guid(guid), type(exc).__name__, exc, exc_info=True,
+        )
+        raise
+    message_id = _extract_msg_id(result)
+    _mark_bot_outgoing(guid, text, message_id)
+    _diag_record(
+        "rubika_outgoing_ok",
+        kind="client.send_message",
+        chat=_mask_guid(guid),
+        message_id=message_id or "-",
+    )
+    log.info(
+        "RUBIKA OUT OK kind=send chat=%s message_id=%s",
+        _mask_guid(guid), message_id or "-",
+    )
     return result
 
 
 async def _reply_and_track(update, text):
     """Reply through rubpy and register the resulting bot message."""
     chat_guid = getattr(update, "object_guid", "") or ""
+    _diag_record(
+        "rubika_outgoing_start",
+        kind="update.reply",
+        chat=_mask_guid(chat_guid),
+        text_chars=len(str(text or "")),
+    )
+    log.info(
+        "RUBIKA OUT START kind=reply chat=%s chars=%s",
+        _mask_guid(chat_guid), len(str(text or "")),
+    )
     _mark_bot_outgoing(chat_guid, text)
-    sent = await update.reply(text)
-    _mark_bot_outgoing(chat_guid, text, _extract_msg_id(sent))
+    try:
+        sent = await update.reply(text)
+    except Exception as exc:
+        _diag_record(
+            "rubika_outgoing_error",
+            kind="update.reply",
+            chat=_mask_guid(chat_guid),
+            exception=type(exc).__name__,
+            error=exc,
+        )
+        log.error(
+            "RUBIKA OUT ERROR kind=reply chat=%s exc=%s: %s",
+            _mask_guid(chat_guid), type(exc).__name__, exc, exc_info=True,
+        )
+        raise
+    message_id = _extract_msg_id(sent)
+    _mark_bot_outgoing(chat_guid, text, message_id)
+    _diag_record(
+        "rubika_outgoing_ok",
+        kind="update.reply",
+        chat=_mask_guid(chat_guid),
+        message_id=message_id or "-",
+    )
+    log.info(
+        "RUBIKA OUT OK kind=reply chat=%s message_id=%s",
+        _mask_guid(chat_guid), message_id or "-",
+    )
     return sent
 
 
@@ -8188,6 +8260,11 @@ def _send_agent_message(
         session=session_key or "default",
         prompt_text=original_prompt,
     )
+    log.info(
+        "GEMINI AGENT START surface=%s session=%s prompt_chars=%s model=%s key_index=%s/%s",
+        _surface_name(chat_guid), session_key or "default", len(original_prompt),
+        GEMINI_AGENT_MODEL, CURRENT_KEY_INDEX, len(GEMINI_API_KEYS),
+    )
     try:
         response = _gemini_send_message(chat, model_prompt)
         _record_agent_history_metadata(session_key, chat)
@@ -8204,6 +8281,12 @@ def _send_agent_message(
             elapsed_ms=int((time.monotonic() - started) * 1000),
             exception=type(exc).__name__,
             error=exc,
+        )
+        log.error(
+            "GEMINI AGENT ERROR surface=%s session=%s elapsed_ms=%s exc=%s: %s",
+            _surface_name(chat_guid), session_key or "default",
+            int((time.monotonic() - started) * 1000), type(exc).__name__, exc,
+            exc_info=True,
         )
         raise
     finally:
@@ -8333,6 +8416,11 @@ def execute_agent_with_rotation_sync(
     max_tries = max(1, len(GEMINI_API_KEYS))
     session_lock = _get_agent_session_lock(session_key)
     for attempt in range(max_tries):
+        log.info(
+            "GEMINI AGENT ATTEMPT surface=%s session=%s attempt=%s/%s key_index=%s",
+            _surface_name(chat_guid), session_key or "default", attempt + 1,
+            max_tries, CURRENT_KEY_INDEX,
+        )
         try:
             with session_lock:
                 chat = get_agent_chat_session(session_key)
@@ -8366,6 +8454,11 @@ async def async_execute_agent_with_rotation(
     max_tries = max(1, len(GEMINI_API_KEYS))
     session_lock = _get_agent_session_lock(session_key)
     for attempt in range(max_tries):
+        log.info(
+            "GEMINI AGENT ATTEMPT surface=%s session=%s attempt=%s/%s key_index=%s",
+            _surface_name(chat_guid), session_key or "default", attempt + 1,
+            max_tries, CURRENT_KEY_INDEX,
+        )
         try:
             # The lock spans the stateful ChatSession transaction. The network
             # work itself runs off the Rubika event loop.
@@ -8494,8 +8587,26 @@ async def handle_messages(update: Updates):
     # author GUID.  Drop only messages present in the bot outgoing ledger; an
     # untracked self-authored text is a manual owner input and may be answered.
     me_guid = norm_id(MY_GUID or getattr(client, "guid", None))
-    if me_guid and author_guid and norm_id(author_guid) == me_guid:
+    self_match = bool(
+        me_guid and author_guid and norm_id(author_guid) == me_guid
+    )
+    bot_generated = False
+    if self_match:
         bot_generated = _is_tracked_bot_message(chat_guid, user_text, message_id)
+        _diag_record(
+            "rubika_self_decision",
+            self_match=True,
+            bot_generated=bot_generated,
+            respond_to_self=RESPOND_TO_SELF_MESSAGES,
+            message_id_present=bool(message_id),
+            text_chars=len(str(user_text or "")),
+        )
+        log.info(
+            "RUBIKA SELF DECISION match=true tracked_bot=%s respond_to_self=%s "
+            "message_id=%s chat=%s",
+            bot_generated, RESPOND_TO_SELF_MESSAGES, message_id or "-",
+            _mask_guid(chat_guid),
+        )
         if bot_generated:
             if message_id:
                 _add_bot_sent_id(message_id)
@@ -8510,6 +8621,19 @@ async def handle_messages(update: Updates):
         owner_authorized = True
         _diag_record("rubika_self_owner_input")
         log.info("RUBIKA SELF INPUT owner_manual=true chat=%s", _mask_guid(chat_guid))
+    else:
+        _diag_record(
+            "rubika_self_decision",
+            self_match=False,
+            bot_generated=False,
+            respond_to_self=RESPOND_TO_SELF_MESSAGES,
+            message_id_present=bool(message_id),
+            text_chars=len(str(user_text or "")),
+        )
+        log.info(
+            "RUBIKA SELF DECISION match=false my_guid=%s author=%s chat=%s",
+            _mask_guid(me_guid), _mask_guid(author_guid), _mask_guid(chat_guid),
+        )
 
     if _is_voice_update(update):
         if not owner_authorized:
@@ -8727,6 +8851,23 @@ async def handle_messages(update: Updates):
         # حالا فقط برای پیام‌هایی اجرا می‌شود که در غیر این صورت کلاً نادیده گرفته می‌شدند
         # (بدون کلمهٔ ماشه و بدون ریپلای به ربات)؛ بقیه از مسیر اصلی پایین رد می‌شوند.
         has_trigger = bool(_TRIGGER_WORD_PATTERN.search(user_text))
+        _diag_record(
+            "rubika_group_gate",
+            mode=GROUP_REPLY_MODE,
+            has_trigger=has_trigger,
+            reply_to_bot=is_reply_to_bot,
+            manual_owner=manual_owner_message,
+            action=(
+                "allow"
+                if GROUP_REPLY_MODE == "all" or is_reply_to_bot or has_trigger
+                else "drop"
+            ),
+        )
+        log.info(
+            "RUBIKA GROUP GATE mode=%s trigger=%s reply_to_bot=%s manual_owner=%s action=%s",
+            GROUP_REPLY_MODE, has_trigger, is_reply_to_bot, manual_owner_message,
+            "allow" if GROUP_REPLY_MODE == "all" or is_reply_to_bot or has_trigger else "drop",
+        )
         if (
             GROUP_REPLY_MODE == "trigger"
             and not is_reply_to_bot
@@ -9115,6 +9256,18 @@ if __name__ == "__main__":
                 or getattr(client, "guid", None)
             )
             log.info("[BOOT] MY_GUID_MASK = %s", _mask_guid(MY_GUID))
+            log.info(
+                "[BOOT] RUBIKA CONFIG mode=%s trigger=%s self_messages=%s "
+                "owner_count=%s owner_match=%s model=%s agent=%s client_guid=%s",
+                GROUP_REPLY_MODE,
+                TRIGGER_WORD,
+                RESPOND_TO_SELF_MESSAGES,
+                len(OWNER_GUIDS),
+                bool(MY_GUID and MY_GUID in OWNER_GUIDS),
+                bool(model),
+                bool(agent_model),
+                _mask_guid(getattr(client, "guid", "")),
+            )
         except Exception as e:
             log.warning("[BOOT] get_me failed: %s", e)
 
