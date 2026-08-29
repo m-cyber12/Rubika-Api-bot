@@ -775,6 +775,111 @@ def _explicit_memory_action(action):
     return any(marker in prompt for marker in markers.get(action, ()))
 
 
+_EXPLICIT_MEMORY_MARKERS = (
+    "اینو یادت باشه",
+    "این رو یادت باشه",
+    "این را یادت باشه",
+    "یادت باشه",
+    "یادت بمونه",
+    "یادم بمونه",
+    "به خاطر بسپار",
+    "به یاد داشته باش",
+    "در حافظه ذخیره کن",
+    "ذخیره کن در حافظه",
+    "remember this",
+    "save this",
+    "store this",
+)
+
+
+def _clean_memory_fact_piece(value):
+    cleaned = " ".join(str(value or "").split())
+    cleaned = re.sub(r"^[\s،,؛;:.：-]+", "", cleaned)
+    cleaned = re.sub(r"[\s،,؛;:.：-]+$", "", cleaned)
+    cleaned = re.sub(r"^(?:که|اینکه|that)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def _extract_explicit_memory_request(text):
+    """Extract a fact from an owner's explicit remember-this sentence."""
+    original = " ".join(str(text or "").split())[:3000]
+    if not original:
+        return None
+    lowered = original.casefold()
+    matches = []
+    for marker in _EXPLICIT_MEMORY_MARKERS:
+        position = lowered.find(marker.casefold())
+        if position >= 0:
+            matches.append((position, marker))
+    if not matches:
+        return None
+    position, marker = min(matches, key=lambda item: item[0])
+    before = original[:position]
+    after = original[position + len(marker):]
+    # In «این را یادت باشه» the text before the marker is only a pronoun;
+    # in «این را یادت باشه که ...» the actual fact follows the marker.
+    before = re.sub(
+        r"(?:^|\s)(?:اینو|این رو|این را|این|اون رو|آن را)\s*$",
+        "",
+        before,
+        flags=re.IGNORECASE,
+    )
+    before = _clean_memory_fact_piece(before)
+    after = _clean_memory_fact_piece(after)
+    fact = before if len(before.split()) >= 3 else after
+    if len(fact.split()) < 3 and len(after.split()) > len(before.split()):
+        fact = after
+    # The group trigger is routing syntax, not part of the fact.
+    try:
+        fact = _TRIGGER_WORD_PATTERN.sub("", fact, count=1).strip()
+    except NameError:
+        fact = fact.replace("فرایدی", "", 1).strip()
+    fact = _clean_memory_fact_piece(fact)[:1000]
+    # Do not steal ordinary reminder/file/action requests that happen to end
+    # with «یادت باشه»; those must keep going through the existing Agent path.
+    action_markers = (
+        "یادم بنداز", "یادآوری", "بیدارم کن", "ارسال کن", "بفرست",
+        "انجام بده", "بساز", "زنگ بزن", "تماس بگیر", "فایل را ذخیره",
+        "فایل رو ذخیره", "روبیکا",
+    )
+    if any(marker in fact.casefold() for marker in action_markers):
+        return None
+    if len(fact) < 5 or len(fact.split()) < 2:
+        return None
+    return {
+        "fact": fact,
+        "key": _memory_key_for_fact(fact),
+        "question": _memory_fallback_question(fact),
+        "answer": _memory_fallback_answer(fact),
+        "source_text": original,
+    }
+
+
+def _memory_key_for_fact(fact):
+    words = set(re.findall(r"\w+", str(fact or "").casefold(), flags=re.UNICODE))
+    if "کلاس" in words and ("هفته" in words or "روز" in words):
+        return "برنامه کلاس هفتگی"
+    if words & {"درس", "دانشگاه", "مدرسه"}:
+        return "برنامه آموزشی"
+    ordered_words = " ".join(str(fact or "").split()).split()
+    return ("یادداشت " + " ".join(ordered_words[:7]))[:80]
+
+
+def _memory_fallback_question(fact):
+    lowered = str(fact or "").casefold()
+    if "کلاس" in lowered:
+        return "من هر هفته چند روز کلاس دارم؟"
+    key = _memory_key_for_fact(fact)
+    return f"دربارهٔ {key} چه اطلاعاتی دارم؟"
+
+
+def _memory_fallback_answer(fact):
+    value = " ".join(str(fact or "").split()).strip()
+    if value and value[-1] not in ".!?؟.!":
+        value += "."
+    return value
+
+
 def _audit_tool(tool_name, status="ok", details=""):
     entry = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -1902,21 +2007,40 @@ def _call_plain_model(prompt):
         return ""
 
 
-def _mirror_memory_to_kb(clean_key, clean_value):
-    """Turn an explicitly remembered private fact into a safe public FAQ pair."""
+def _mirror_memory_to_kb(clean_key, clean_value, fallback_pair=None):
+    """Turn an explicitly remembered private fact into a safe public FAQ pair.
+
+    The deterministic explicit-memory path may provide a safe local fallback
+    pair. During an active quota cooldown it avoids another Gemini request, so
+    the KB mirror can still happen after the private memory was persisted.
+    """
     if getattr(_agent_context, "private_memory", False):
         return False
     if _contains_private_info(clean_key, clean_value):
         log.info("MEMORY KB mirror skipped as private key=%s", clean_key)
         return False
-    prompt = (
-        "این واقعیت متعلق به صاحب دستیار است. آن را کلمه‌به‌کلمه کپی نکن. "
-        "اگر برای یک FAQ عمومی بی‌خطر است، فقط JSON معتبر و بدون markdown بده: "
-        '{"question":"سوال طبیعی به فارسی","answer":"پاسخ کوتاه به فارسی با لحن دستیار"}. '
-        "سوال و پاسخ باید با بیان خودت باشند. اگر شخصی، محرمانه، قابل‌شناسایی یا نامناسب برای FAQ عمومی است، {} بده.\n"
-        f"کلید: {clean_key}\nواقعیت: {clean_value}"
-    )
-    pair = _json_object_from_text(_call_plain_model(prompt))
+
+    fallback = dict(fallback_pair) if isinstance(fallback_pair, dict) else None
+    if fallback and _active_gemini_quota_message():
+        pair = fallback
+    else:
+        prompt = (
+            "این واقعیت متعلق به صاحب دستیار است. آن را کلمه‌به‌کلمه کپی نکن. "
+            "اگر برای یک FAQ عمومی بی‌خطر است، فقط JSON معتبر و بدون markdown بده: "
+            '{"question":"سوال طبیعی به فارسی","answer":"پاسخ کوتاه به فارسی با لحن دستیار"}. '
+            "سوال و پاسخ باید با بیان خودت باشند. اگر شخصی، محرمانه، قابل‌شناسایی یا نامناسب برای FAQ عمومی است، {} بده.\n"
+            f"کلید: {clean_key}\nواقعیت: {clean_value}"
+        )
+        pair = _json_object_from_text(_call_plain_model(prompt))
+        # A provider outage/malformed response must not erase the safe,
+        # deterministic mirror prepared for an explicit owner request.
+        if fallback and (
+            not isinstance(pair, dict)
+            or not str(pair.get("question") or "").strip()
+            or not str(pair.get("answer") or "").strip()
+        ):
+            pair = fallback
+
     question = " ".join(str(pair.get("question") or "").split())[:500]
     answer = " ".join(str(pair.get("answer") or "").split())[:5000]
     if not question or not answer:
@@ -1970,11 +2094,80 @@ def remember_information(key: str, value: str) -> str:
     # The raw memory path above remains private and explicit-only.  The second
     # path is a paraphrased, sensitivity-checked FAQ entry and may be skipped.
     try:
-        _mirror_memory_to_kb(clean_key, clean_value)
+        _mirror_memory_to_kb(
+            clean_key,
+            clean_value,
+            fallback_pair=getattr(_agent_context, "memory_kb_fallback_pair", None),
+        )
     except Exception as exc:
         log.warning("MEMORY KB mirror error: %s", type(exc).__name__)
     _audit_tool("remember_information", "ok", f"key={clean_key}")
     return f"اطلاعات با کلید «{clean_key}» ذخیره شد."
+
+
+
+def _persist_explicit_memory_request(text, actor="", chat_guid=""):
+    """Persist an owner's explicit remember request without asking the model."""
+    request = _extract_explicit_memory_request(text)
+    if not request:
+        return None
+
+    saved_context = {
+        field: (hasattr(_agent_context, field), getattr(_agent_context, field, None))
+        for field in (
+            "actor", "chat_guid", "user_prompt", "private_memory",
+            "memory_kb_fallback_pair",
+        )
+    }
+    result = ""
+    try:
+        _agent_context.actor = str(actor or "")[:120]
+        _agent_context.chat_guid = str(chat_guid or "")[:120]
+        _agent_context.user_prompt = str(text or "")[:5000]
+        # Keep the normal explicit-memory behavior: the JSON memory is private,
+        # while the KB mirror is allowed only after its existing safety checks.
+        _agent_context.private_memory = False
+        _agent_context.memory_kb_fallback_pair = {
+            "question": request["question"],
+            "answer": request["answer"],
+        }
+        result = remember_information(request["key"], request["fact"])
+    except Exception as exc:
+        log.error("EXPLICIT MEMORY PERSIST ERROR: %s", exc, exc_info=True)
+        result = f"ذخیره نشد: خطای داخلی {type(exc).__name__}."
+    finally:
+        for field, (was_set, value) in saved_context.items():
+            if was_set:
+                setattr(_agent_context, field, value)
+            else:
+                try:
+                    delattr(_agent_context, field)
+                except AttributeError:
+                    pass
+
+    saved = str(result).startswith("اطلاعات با کلید")
+    _diag_record(
+        "explicit_memory_capture",
+        actor=actor,
+        chat=_surface_name(chat_guid),
+        saved=saved,
+        key=request["key"],
+    )
+    if saved:
+        return {
+            "ok": True,
+            "fact": request["fact"],
+            "reply": f"✅ حتماً، ذخیره شد: {request['fact']}",
+            "mode": "explicit_memory",
+            "result": result,
+        }
+    return {
+        "ok": False,
+        "fact": request["fact"],
+        "reply": result or "ذخیره نشد: ذخیره‌سازی قطعی انجام نشد.",
+        "mode": "explicit_memory_failed",
+        "result": result,
+    }
 
 
 def recall_information(query: str) -> str:
@@ -4676,6 +4869,74 @@ def _touch_kb(question):
     with _lock_kb:
         if question in knowledge_base:
             _kb_last_used[question] = time.time()
+
+
+
+_KB_QUERY_STOPWORDS = frozenset({
+    "من", "ما", "تو", "او", "را", "به", "در", "از", "که", "این", "آن",
+    "یک", "و", "برای", "است", "هستم", "هست", "دارم", "ام", "می", "میشه",
+    "شود", "چطور", "چگونه", "آیا", "the", "what", "do", "i", "my", "how",
+    "many", "is", "a", "an", "in", "of", "to",
+})
+_KB_QUERY_ALIASES = {
+    "جلسات": "جلسه",
+    "جلسه‌ها": "جلسه",
+    "جلسهها": "جلسه",
+    "کلاس‌ها": "کلاس",
+    "کلاسها": "کلاس",
+    "روزها": "روز",
+}
+_KB_COUNT_TERMS = frozenset({
+    "چند", "تعداد", "جلسه", "روز", "هفته", "مقدار", "میزان",
+    "many", "number", "days",
+})
+
+
+def _kb_query_tokens(value):
+    tokens = re.findall(r"\w+", str(value or "").casefold(), flags=re.UNICODE)
+    normalized = {_KB_QUERY_ALIASES.get(token, token) for token in tokens}
+    return {token for token in normalized if token not in _KB_QUERY_STOPWORDS and len(token) > 1}
+
+
+def _lookup_kb_answer(query):
+    """Return (answer, matched_question), with a conservative local semantic lookup."""
+    normalized = " ".join(str(query or "").casefold().split())
+    if not normalized:
+        return "", ""
+    with _lock_kb:
+        for question, answer in knowledge_base.items():
+            if " ".join(str(question).casefold().split()) == normalized:
+                return answer, question
+
+        query_tokens = _kb_query_tokens(query)
+        if not query_tokens:
+            return "", ""
+        query_is_class_count = (
+            "کلاس" in query_tokens
+            and bool(query_tokens & _KB_COUNT_TERMS)
+        )
+        best = None
+        for question, answer in knowledge_base.items():
+            question_tokens = _kb_query_tokens(question)
+            common = query_tokens & question_tokens
+            class_count_match = (
+                query_is_class_count
+                and "کلاس" in question_tokens
+                and bool(question_tokens & _KB_COUNT_TERMS)
+            )
+            if class_count_match:
+                score = 1.0
+            else:
+                denominator = max(1, min(len(query_tokens), len(question_tokens)))
+                score = len(common) / denominator
+                if len(common) < 2 or score < 0.5:
+                    continue
+            candidate = (score, len(common), question, answer)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+        if best is not None:
+            return best[3], best[2]
+    return "", ""
 
 
 def _save_kb_suggestions_locked():
@@ -7733,6 +7994,9 @@ def api_stats():
 
 
 def _process_dashboard_message(msg, actor):
+    explicit_memory = _persist_explicit_memory_request(msg, actor, "dashboard")
+    if explicit_memory:
+        return explicit_memory["reply"], explicit_memory["mode"]
     rubika_query = _parse_rubika_read_request(msg)
     if rubika_query:
         result = search_rubika_readonly(rubika_query)
@@ -7749,15 +8013,9 @@ def _process_dashboard_message(msg, actor):
         ), "server_tool"
     if is_direct_web_request(msg):
         return execute_direct_web_search(msg, actor=actor), "direct_web_search"
-    with _lock_kb:
-        kb_answer = knowledge_base.get(msg)
-        if not kb_answer:
-            normalized = " ".join(str(msg).casefold().split())
-            for question, answer in knowledge_base.items():
-                if " ".join(str(question).casefold().split()) == normalized:
-                    kb_answer = answer
-                    _touch_kb(question)
-                    break
+    kb_answer, matched_kb_key = _lookup_kb_answer(msg)
+    if matched_kb_key:
+        _touch_kb(matched_kb_key)
     if kb_answer:
         return kb_answer, "knowledge"
     if not agent_model:
@@ -7821,7 +8079,7 @@ def api_chat():
         )
         if mode in {"knowledge", "kb"}:
             _maybe_suggest_recurring_ask(msg, "dashboard")
-        else:
+        elif mode not in {"explicit_memory", "explicit_memory_failed"}:
             _schedule_passive_learning(
                 msg, "dashboard", "dashboard", True, "dashboard"
             )
@@ -7894,7 +8152,7 @@ def api_voice_chat():
         )
         if mode in {"knowledge", "kb"}:
             _maybe_suggest_recurring_ask(transcript, "dashboard")
-        else:
+        elif mode not in {"explicit_memory", "explicit_memory_failed"}:
             _schedule_passive_learning(
                 transcript, "dashboard_voice", "dashboard", True, "dashboard"
             )
@@ -8826,6 +9084,40 @@ async def handle_messages(update: Updates):
         main_loop_ready.set()
 
     if not model:
+        # Explicit memory is a local persistence action and must remain usable
+        # even when Gemini is not configured.  Respect the same strict group
+        # trigger gate and outgoing-message loop guard before handling it.
+        owner_candidate = is_owner_message(author_guid, chat_guid)
+        explicit_candidate = bool(_extract_explicit_memory_request(user_text))
+        group_allowed = (
+            chat_guid.startswith("u0")
+            or GROUP_REPLY_MODE == "all"
+            or bool(_TRIGGER_WORD_PATTERN.search(str(user_text or "")))
+        )
+        tracked_outgoing = _is_tracked_bot_message(chat_guid, user_text, message_id)
+        if owner_candidate and explicit_candidate and group_allowed and not tracked_outgoing:
+            captured = await asyncio.to_thread(
+                _persist_explicit_memory_request,
+                user_text,
+                f"rubika:{author_guid or chat_guid}",
+                chat_guid,
+            )
+            if captured:
+                try:
+                    sent = await _reply_and_track(update, captured["reply"])
+                    final_reply = captured["reply"]
+                    _record_unified_interaction(
+                        _surface_name(chat_guid),
+                        str(user_text or "")[:3000],
+                        final_reply,
+                        _message_is_unresolved(user_text, final_reply),
+                    )
+                    sent_id = _extract_msg_id(sent)
+                    if sent_id is not None:
+                        _add_bot_sent_id(sent_id)
+                except Exception as exc:
+                    log.error("MODEL-DISABLED MEMORY REPLY ERROR: %s", exc, exc_info=True)
+                return
         _diag_record("rubika_drop_model_disabled")
         log.warning("RUBIKA DROP reason=model_disabled")
         return  # AI غیرفعاله
@@ -9157,6 +9449,32 @@ async def handle_messages(update: Updates):
     if owner_authorized:
         proactive_text = _maybe_daily_briefing(source_name)
 
+    # Explicit owner memory is a deterministic application action.  It must run
+    # before Agent/model routing so a fluent model response cannot claim success
+    # when no persistence happened.
+    if owner_authorized:
+        explicit_memory = await asyncio.to_thread(
+            _persist_explicit_memory_request,
+            incoming_user_text,
+            f"rubika:{author_guid or chat_guid}",
+            chat_guid,
+        )
+        if explicit_memory:
+            final_reply = _with_proactive_prefix(
+                explicit_memory["reply"], proactive_text, handoff_text
+            )
+            sent = await _reply_text_and_voice(
+                update, final_reply, with_voice=voice_reply_requested
+            )
+            _record_unified_interaction(
+                source_name, incoming_user_text, final_reply,
+                _message_is_unresolved(incoming_user_text, final_reply),
+            )
+            sid = _extract_msg_id(sent)
+            if sid is not None:
+                _add_bot_sent_id(sid)
+            return
+
     log.info("MSG  chat=%s text_chars=%s", _mask_guid(chat_guid), len(str(user_text)))
 
     # خواندن/آماده‌سازی عملیات روبیکا با refهای موقت؛ نوشتن هنوز نیازمند تأیید است.
@@ -9230,16 +9548,7 @@ async def handle_messages(update: Updates):
         return
 
     # ──── پاسخ از دانش ────
-    with _lock_kb:
-        kb_answer = knowledge_base.get(user_text)
-        matched_kb_key = user_text if kb_answer else ""
-        if not kb_answer:
-            norm_q = " ".join(user_text.casefold().split())
-            for kq, ka in knowledge_base.items():
-                if " ".join(kq.casefold().split()) == norm_q:
-                    kb_answer = ka
-                    matched_kb_key = kq
-                    break
+    kb_answer, matched_kb_key = _lookup_kb_answer(user_text)
     if matched_kb_key:
         _touch_kb(matched_kb_key)
 
