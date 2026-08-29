@@ -314,7 +314,7 @@ GEMINI_API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 CURRENT_KEY_INDEX = 0
 # _lock_api_key در بلوک قفل‌ها (سلسله‌مراتب قفل) تعریف می‌شود.
 
-APP_VERSION = "phase3-rubika-strict-trigger-debug-v1.6"
+APP_VERSION = "phase3-rubika-strict-trigger-debug-v1.8"
 OWNER_NAME = os.environ.get("OWNER_NAME", "حسن").strip()
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
 OWNER_GUIDS = _csv_env("OWNER_GUIDS")
@@ -506,6 +506,10 @@ _init_done = False
 # can appear to hang after a successful first message.
 _agent_session_lock_guard = threading.Lock()
 _agent_session_locks: dict[str, threading.RLock] = {}
+# The legacy Gemini SDK uses process-global configuration.  Background
+# profile/KB calls must not reconfigure the SDK or use the same transport while
+# an owner Agent request is in flight.
+_gemini_call_lock = threading.RLock()
 
 # A Rubika user-session reports manually sent messages and bot replies with the
 # same author GUID.  The only reliable distinction is the bot's outgoing-ID
@@ -1782,16 +1786,21 @@ def _json_object_from_text(raw_text):
 def _gemini_send_message(chat, content):
     """Send with a bounded SDK timeout while remaining compatible with older SDKs."""
     request_options = {"timeout": GEMINI_REQUEST_TIMEOUT_SECONDS}
-    try:
-        return chat.send_message(content, request_options=request_options)
-    except TypeError as exc:
-        # The pinned google-generativeai SDK accepts request_options. Keep a
-        # compatibility fallback for a different deployment package, but do
-        # not hide unrelated TypeErrors raised by the model call.
-        if "request_options" not in str(exc) and "unexpected keyword" not in str(exc):
-            raise
-        log.warning("GEMINI SDK ignored request_options; using legacy call")
-        return chat.send_message(content)
+    # google-generativeai keeps API configuration in module-global state.  A
+    # passive-learning worker changing keys while this call is running can
+    # otherwise corrupt an in-flight Agent request and surface as a generic
+    # Rubika error.
+    with _gemini_call_lock:
+        try:
+            return chat.send_message(content, request_options=request_options)
+        except TypeError as exc:
+            # The pinned google-generativeai SDK accepts request_options. Keep a
+            # compatibility fallback for a different deployment package, but do
+            # not hide unrelated TypeErrors raised by the model call.
+            if "request_options" not in str(exc) and "unexpected keyword" not in str(exc):
+                raise
+            log.warning("GEMINI SDK ignored request_options; using legacy call")
+            return chat.send_message(content)
 
 
 def _call_plain_model(prompt):
@@ -3371,6 +3380,10 @@ def _should_reply_with_voice(text, input_is_voice=False):
         "ویس جواب بده",
         "صوتی جواب بده",
         "پاسخ صوتی",
+        "به صورت صوتی",
+        "به‌صورت صوتی",
+        "بصورت صوتی",
+        "بصورت صدا",
         "با صدا جواب بده",
         "برام بخون",
         "رو بخون",
@@ -7134,11 +7147,35 @@ def dashboard():
 # health عمومی است و عمداً جزئیات تنظیمات یا سشن را افشا نمی‌کند.
 @app.route("/api/health")
 def api_health():
-    return jsonify({
+    payload = {
         "status": "ok",
         "version": APP_VERSION,
         "timestamp": datetime.now().isoformat(),
-    })
+    }
+    # A deliberately small, secret-free diagnostic view is available through
+    # the public health route during a debugging deployment.  The full
+    # diagnostics endpoint remains protected by dashboard authentication.
+    debug_requested = str(request.args.get("debug", "")).strip().casefold() in {
+        "1", "true", "yes", "on"
+    }
+    if debug_requested:
+        snapshot = _diagnostic_snapshot()
+        payload["debug"] = {
+            "config": {
+                "group_reply_mode": GROUP_REPLY_MODE,
+                "trigger_word": TRIGGER_WORD,
+                "respond_to_self_messages": RESPOND_TO_SELF_MESSAGES,
+                "model_enabled": bool(model),
+                "agent_enabled": bool(agent_model),
+            },
+            "runtime": {
+                "main_loop_running": bool(main_loop is not None and main_loop.is_running()),
+                "my_guid_mask": _mask_guid(MY_GUID),
+                "client_guid_mask": _mask_guid(getattr(client, "guid", "")),
+            },
+            "diagnostics": snapshot,
+        }
+    return jsonify(payload)
 
 
 @app.route("/api/health/detailed")
@@ -8822,6 +8859,11 @@ async def handle_messages(update: Updates):
                 return
 
     # ──── فیلتر پیام ────
+    # These values are also consumed by the trigger/reset logic below.  A
+    # private update has no group reply lookup, so initialize them explicitly
+    # instead of leaving `is_reply_to_bot` undefined on private trigger input.
+    reply_str = None
+    is_reply_to_bot = False
     is_private = chat_guid.startswith("u0")
     if is_private:
         if author_guid and author_guid != chat_guid:
@@ -9042,16 +9084,25 @@ async def handle_messages(update: Updates):
                 response = await async_execute_with_rotation(chat_guid, prompt_text)
                 chat = get_chat_session(chat_guid)
         except Exception as exc:
+            error_ref = uuid.uuid4().hex[:8]
             _diag_record(
                 "rubika_ai_error",
+                error_ref=error_ref,
                 exception=type(exc).__name__,
                 error=exc,
                 surface=source_name,
             )
-            log.error("ERROR in AI/Agent response generation: %s", exc, exc_info=True)
+            log.error(
+                "ERROR in AI/Agent response generation ref=%s surface=%s "
+                "model=%s agent_model=%s key_index=%s/%s: %s",
+                error_ref, source_name, GEMINI_MODEL, GEMINI_AGENT_MODEL,
+                CURRENT_KEY_INDEX, len(GEMINI_API_KEYS), exc, exc_info=True,
+            )
             try:
                 await _reply_and_track(
-                    update, "⚠️ پاسخ‌گویی موقتاً با خطا روبه‌رو شد؛ چند لحظه بعد دوباره امتحان کن."
+                    update,
+                    "⚠️ پاسخ‌گویی موقتاً با خطا روبه‌رو شد؛ "
+                    f"کد خطا: {error_ref}؛ چند لحظه بعد دوباره امتحان کن.",
                 )
             except Exception as reply_exc:
                 _diag_record(
