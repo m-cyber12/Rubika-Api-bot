@@ -314,6 +314,7 @@ GEMINI_API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 CURRENT_KEY_INDEX = 0
 # _lock_api_key در بلوک قفل‌ها (سلسله‌مراتب قفل) تعریف می‌شود.
 
+APP_VERSION = "phase3-rubika-strict-trigger-debug-v1.6"
 OWNER_NAME = os.environ.get("OWNER_NAME", "حسن").strip()
 OWNER_CONTROL_GROUP = os.environ.get("OWNER_CONTROL_GROUP", "").strip()
 OWNER_GUIDS = _csv_env("OWNER_GUIDS")
@@ -7135,7 +7136,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase3-voice-v1.5-diagnostics",
+        "version": APP_VERSION,
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -8846,46 +8847,26 @@ async def handle_messages(update: Updates):
                 f"sent_ids_count={len(bot_sent_message_ids)}"
             )
 
-        # باگ #10: قبلاً این تابع دو بار روی یک پیام اجرا می‌شد (یک بار اینجا و یک بار
-        # پایین‌تر به‌صورت بدون شرط) که یعنی دو برابر جستجوی وب و دو برابر مصرف سهمیه.
-        # حالا فقط برای پیام‌هایی اجرا می‌شود که در غیر این صورت کلاً نادیده گرفته می‌شدند
-        # (بدون کلمهٔ ماشه و بدون ریپلای به ربات)؛ بقیه از مسیر اصلی پایین رد می‌شوند.
+        # Trigger mode is intentionally strict: in a group only a message that
+        # contains the trigger is allowed through.  A reply to the bot and a
+        # direct web-looking question must not bypass this gate; otherwise a
+        # normal group message can still produce an unexpected response.
         has_trigger = bool(_TRIGGER_WORD_PATTERN.search(user_text))
+        gate_allowed = GROUP_REPLY_MODE == "all" or has_trigger
         _diag_record(
             "rubika_group_gate",
             mode=GROUP_REPLY_MODE,
             has_trigger=has_trigger,
             reply_to_bot=is_reply_to_bot,
             manual_owner=manual_owner_message,
-            action=(
-                "allow"
-                if GROUP_REPLY_MODE == "all" or is_reply_to_bot or has_trigger
-                else "drop"
-            ),
+            action="allow" if gate_allowed else "drop",
         )
         log.info(
             "RUBIKA GROUP GATE mode=%s trigger=%s reply_to_bot=%s manual_owner=%s action=%s",
             GROUP_REPLY_MODE, has_trigger, is_reply_to_bot, manual_owner_message,
-            "allow" if GROUP_REPLY_MODE == "all" or is_reply_to_bot or has_trigger else "drop",
+            "allow" if gate_allowed else "drop",
         )
-        if (
-            GROUP_REPLY_MODE == "trigger"
-            and not is_reply_to_bot
-            and not has_trigger
-        ):
-            if await _try_handle_direct_web_request(
-                update,
-                user_text,
-                chat_guid,
-                author_guid,
-                owner_authorized,
-                voice_reply_requested,
-                prefix_text=_maybe_daily_briefing(source_name) if owner_authorized else "",
-                handoff_text=handoff_text,
-            ):
-                _diag_record("rubika_direct_web_reply")
-                return
-            # نه ماشه، نه ریپلای، نه درخواست وب ⇒ نادیده بگیر
+        if GROUP_REPLY_MODE == "trigger" and not has_trigger:
             _diag_record("rubika_drop_group_no_trigger")
             log.info(
                 "RUBIKA DROP reason=group_no_trigger chat=%s trigger=%s",
@@ -8893,7 +8874,7 @@ async def handle_messages(update: Updates):
             )
             return
 
-        log.info("FLOW_CHECK after direct search, proceeding to trigger word check")
+        log.info("FLOW_CHECK after group gate; proceeding to trigger word check")
 
         if _TRIGGER_WORD_PATTERN.search(user_text):
             user_text = _TRIGGER_WORD_PATTERN.sub("", user_text, count=1).strip()
