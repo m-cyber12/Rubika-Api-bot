@@ -35,6 +35,10 @@
 - OWNER_PROFILE_COOLDOWN_SECONDS=21600
 - PUBLIC_BASE_URL=https://YOUR-SERVICE.onrender.com
 - FILE_SIGNING_SECRET=...          اختیاری؛ پیش‌فرض DASHBOARD_PASSWORD
+- DEBUG_DIAGNOSTICS=false          لاگ تشخیصی مسیر پیام‌ها و API
+- GEMINI_REQUEST_TIMEOUT_SECONDS=60  مهلت هر درخواست Gemini
+- GROUP_REPLY_MODE=trigger          trigger یا all برای پیام‌های گروه
+- RESPOND_TO_SELF_MESSAGES=true     پاسخ به پیام دستی همان حساب، بدون حلقهٔ خودکار
 
 متغیرهای مرحلهٔ سوم:
 - GROQ_API_KEY=...                 ضروری برای Speech-to-Text
@@ -317,6 +321,17 @@ OWNER_GUIDS = _csv_env("OWNER_GUIDS")
 # remain separate so replies still go to the correct Rubika conversation.
 UNIFIED_OWNER_SESSION_KEY = "owner_unified"
 TRIGGER_WORD = os.environ.get("TRIGGER_WORD", "فرایدی").strip() or "فرایدی"
+DEBUG_DIAGNOSTICS = _bool_env("DEBUG_DIAGNOSTICS", False)
+GEMINI_REQUEST_TIMEOUT_SECONDS = int(
+    _float_env("GEMINI_REQUEST_TIMEOUT_SECONDS", 60, 10, 300)
+)
+GROUP_REPLY_MODE = os.environ.get("GROUP_REPLY_MODE", "trigger").strip().casefold()
+if GROUP_REPLY_MODE not in {"trigger", "all"}:
+    GROUP_REPLY_MODE = "trigger"
+RESPOND_TO_SELF_MESSAGES = _bool_env("RESPOND_TO_SELF_MESSAGES", True)
+BOT_MESSAGE_FINGERPRINT_TTL_SECONDS = int(
+    _float_env("BOT_MESSAGE_FINGERPRINT_TTL_SECONDS", 90, 5, 600)
+)
 
 # Compile trigger word regex once for performance (after TRIGGER_WORD is defined)
 _TRIGGER_WORD_PATTERN = re.compile(rf'\b{re.escape(TRIGGER_WORD)}\b', re.IGNORECASE)
@@ -484,10 +499,79 @@ _grounding_blocked_until = 0.0
 _agent_context = threading.local()
 _init_done = False
 
+# Gemini ChatSession is stateful and is not safe to use concurrently from the
+# Flask thread and the Rubika event-loop worker.  One shared owner session must
+# therefore be serialized, otherwise history can be interleaved or a request
+# can appear to hang after a successful first message.
+_agent_session_lock_guard = threading.Lock()
+_agent_session_locks: dict[str, threading.RLock] = {}
+
+# A Rubika user-session reports manually sent messages and bot replies with the
+# same author GUID.  The only reliable distinction is the bot's outgoing-ID
+# ledger, supplemented by a short-lived (chat, text) fingerprint for the tiny
+# race before Rubika returns an outgoing message ID.
+_bot_fingerprint_lock = threading.Lock()
+_recent_bot_message_fingerprints: dict[tuple[str, str], float] = {}
+
+# Runtime diagnostics deliberately store only masked identifiers,
+# sizes, timings and redacted exception summaries; never prompts or secrets.
+_diagnostic_lock = threading.Lock()
+_diagnostic_counters: dict[str, int] = {}
+_diagnostic_last: dict[str, dict] = {}
+_diagnostic_started_at = time.time()
+
 # TTS Cache configuration (using defaults, can be overridden by env)
 TTS_CACHE_MAX_ITEMS = int(_float_env("TTS_CACHE_MAX_ITEMS", DEFAULT_TTS_CACHE_MAX_ITEMS, 1, 100))
 TTS_CACHE_MAX_BYTES = int(_float_env("TTS_CACHE_MAX_BYTES", DEFAULT_TTS_CACHE_MAX_BYTES, 100_000, 50_000_000))
 TTS_CACHE_TTL_SECONDS = int(_float_env("TTS_CACHE_TTL_SECONDS", DEFAULT_TTS_CACHE_TTL_SECONDS, 60, 86400))
+
+
+def _diagnostic_error(exc):
+    """Redact common credential forms before an error reaches diagnostics/logs."""
+    value = str(exc or "")
+    value = re.sub(r"AIza[0-9A-Za-z_-]{12,}", "<redacted-key>", value)
+    value = re.sub(r"sk-[0-9A-Za-z_-]{12,}", "<redacted-key>", value)
+    value = re.sub(r"(?i)(bearer\s+)[0-9A-Za-z._-]{12,}", r"\1<redacted>", value)
+    return value[:300]
+
+
+def _diag_record(event, **fields):
+    """Record a small, secret-free diagnostic event and optionally log it."""
+    event = str(event)[:80]
+    safe = {}
+    for key, value in fields.items():
+        key = str(key)[:50]
+        if key.endswith("_text") or key == "prompt":
+            safe[key + "_chars"] = len(str(value or ""))
+        elif key in {"error", "exception"} and value is not None:
+            safe[key] = _diagnostic_error(value)
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            safe[key] = str(value)[:300] if isinstance(value, str) else value
+        else:
+            safe[key] = str(value)[:300]
+    safe["at"] = datetime.now(SERVER_TZ).isoformat(timespec="seconds")
+    with _diagnostic_lock:
+        _diagnostic_counters[event] = _diagnostic_counters.get(event, 0) + 1
+        _diagnostic_last[event] = safe
+    if DEBUG_DIAGNOSTICS:
+        detail = " ".join(f"{k}={v}" for k, v in safe.items() if k != "at")
+        log.info("DIAG %s %s", event, detail)
+
+
+def _diagnostic_snapshot():
+    with _diagnostic_lock:
+        return {
+            "uptime_seconds": max(0, int(time.time() - _diagnostic_started_at)),
+            "counters": dict(_diagnostic_counters),
+            "last": {key: dict(value) for key, value in _diagnostic_last.items()},
+        }
+
+
+def _get_agent_session_lock(session_key):
+    key = str(session_key or "")[:160] or UNIFIED_OWNER_SESSION_KEY
+    with _agent_session_lock_guard:
+        return _agent_session_locks.setdefault(key, threading.RLock())
+
 
 if not GEMINI_API_KEYS:
     log.error("❌ GEMINI_API_KEY تنظیم نشده! ربات بدون AI کار نمی‌کنه.")
@@ -499,6 +583,11 @@ if not GROQ_API_KEY:
     log.warning("⚠️ GROQ_API_KEY تنظیم نشده؛ ورودی صوتی غیرفعال است.")
 if edge_tts is None:
     log.warning("⚠️ edge-tts نصب نشده؛ پاسخ صوتی غیرفعال و پاسخ متنی فعال است.")
+if DEBUG_DIAGNOSTICS:
+    log.info(
+        "🔧 DEBUG_DIAGNOSTICS فعال | Gemini timeout=%ss | Group reply mode=%s",
+        GEMINI_REQUEST_TIMEOUT_SECONDS, GROUP_REPLY_MODE,
+    )
 
 
 BOT_PERSONA = f"""
@@ -1530,7 +1619,7 @@ async def _try_handle_direct_web_request(
     except Exception as exc:
         log.error("DIRECT SEARCH ERROR: %s", exc, exc_info=True)
         try:
-            await update.reply("متأسفانه جست‌وجوی وب موقتاً در دسترس نیست.")
+            await _reply_and_track(update, "متأسفانه جست‌وجوی وب موقتاً در دسترس نیست.")
         except Exception:
             pass
     return True
@@ -1689,6 +1778,21 @@ def _json_object_from_text(raw_text):
     return {}
 
 
+def _gemini_send_message(chat, content):
+    """Send with a bounded SDK timeout while remaining compatible with older SDKs."""
+    request_options = {"timeout": GEMINI_REQUEST_TIMEOUT_SECONDS}
+    try:
+        return chat.send_message(content, request_options=request_options)
+    except TypeError as exc:
+        # The pinned google-generativeai SDK accepts request_options. Keep a
+        # compatibility fallback for a different deployment package, but do
+        # not hide unrelated TypeErrors raised by the model call.
+        if "request_options" not in str(exc) and "unexpected keyword" not in str(exc):
+            raise
+        log.warning("GEMINI SDK ignored request_options; using legacy call")
+        return chat.send_message(content)
+
+
 def _call_plain_model(prompt):
     """Make one ordinary no-tools Gemini request for cheap classification/rewriting."""
     if not GEMINI_API_KEYS:
@@ -1704,7 +1808,7 @@ def _call_plain_model(prompt):
         chat = plain_model.start_chat(
             history=[], enable_automatic_function_calling=False
         )
-        return chat.send_message(str(prompt)[:7000])
+        return _gemini_send_message(chat, str(prompt)[:7000])
 
     try:
         response = execute_with_rotation(_request)
@@ -3275,20 +3379,84 @@ def _should_reply_with_voice(text, input_is_voice=False):
     return any(marker in value for marker in positive_markers)
 
 
-async def _reply_text_and_voice(update, text, with_voice=False):
+def _message_fingerprint(chat_guid, text):
+    chat = str(chat_guid or "").strip()[:120]
+    clean = " ".join(str(text or "").casefold().split())[:800]
+    return chat, clean
+
+
+def _mark_bot_outgoing(chat_guid, text="", message_id=None):
+    """Remember a message sent by this account without storing its contents."""
+    if message_id is not None:
+        _add_bot_sent_id(message_id)
+    chat, clean = _message_fingerprint(chat_guid, text)
+    if not chat or not clean:
+        return
+    now = time.monotonic()
+    with _bot_fingerprint_lock:
+        for key, timestamp in list(_recent_bot_message_fingerprints.items()):
+            if now - timestamp > BOT_MESSAGE_FINGERPRINT_TTL_SECONDS:
+                _recent_bot_message_fingerprints.pop(key, None)
+        _recent_bot_message_fingerprints[(chat, clean)] = now
+
+
+def _is_tracked_bot_message(chat_guid, text="", message_id=None):
+    """Return True only for an outgoing message known to be sent by the bot."""
+    normalized_id = norm_id(message_id)
+    if normalized_id:
+        with _lock_sent:
+            if normalized_id in bot_sent_message_ids:
+                return True
+    chat, clean = _message_fingerprint(chat_guid, text)
+    if not chat or not clean:
+        return False
+    now = time.monotonic()
+    with _bot_fingerprint_lock:
+        timestamp = _recent_bot_message_fingerprints.get((chat, clean))
+        if timestamp is None:
+            return False
+        if now - timestamp > BOT_MESSAGE_FINGERPRINT_TTL_SECONDS:
+            _recent_bot_message_fingerprints.pop((chat, clean), None)
+            return False
+        return True
+
+
+async def _send_rubika_message(guid, text, reply_to=None):
+    """Send a message and register it before/after the server call for loop safety."""
+    _mark_bot_outgoing(guid, text)
+    if reply_to:
+        result = await client.send_message(
+            guid, text, reply_to_message_id=norm_id(reply_to)
+        )
+    else:
+        result = await client.send_message(guid, text)
+    _mark_bot_outgoing(guid, text, _extract_msg_id(result))
+    return result
+
+
+async def _reply_and_track(update, text):
+    """Reply through rubpy and register the resulting bot message."""
+    chat_guid = getattr(update, "object_guid", "") or ""
+    _mark_bot_outgoing(chat_guid, text)
     sent = await update.reply(text)
-    sid = _extract_msg_id(sent)
-    if sid is not None:
-        _add_bot_sent_id(sid)
+    _mark_bot_outgoing(chat_guid, text, _extract_msg_id(sent))
+    return sent
+
+
+async def _reply_text_and_voice(update, text, with_voice=False):
+    sent = await _reply_and_track(update, text)
     if not with_voice:
         return sent
     try:
         audio = await synthesize_speech(text)
-        await update.reply_voice(
+        chat_guid = getattr(update, "object_guid", "") or ""
+        _mark_bot_outgoing(chat_guid)
+        voice_sent = await update.reply_voice(
             audio,
             file_name="loki_reply.mp3",
             audio_info=True,
         )
+        _mark_bot_outgoing(chat_guid, message_id=_extract_msg_id(voice_sent))
     except Exception as exc:
         log.warning("VOICE REPLY TTS ERROR: %s", exc)
         _audit_tool("voice_synthesis", "error", type(exc).__name__)
@@ -3837,7 +4005,7 @@ async def _confirm_rubika_action_async(code, confirmer_guid, trusted_dashboard=F
         try:
             action = item["action"]
             if action == "send_message":
-                result = await client.send_message(chat["guid"], item["text"])
+                result = await _send_rubika_message(chat["guid"], item["text"])
             else:
                 if not message:
                     raise ValueError("message_ref منقضی شده است.")
@@ -5187,15 +5355,7 @@ def send_msg_sync(guid, text, reply_to=None):
 
     async def _send():
         try:
-            if reply_to:
-                result = await client.send_message(
-                    guid, text, reply_to_message_id=reply_to
-                )
-            else:
-                result = await client.send_message(guid, text)
-            mid = _extract_msg_id(result)
-            if mid is not None:
-                _add_bot_sent_id(mid)
+            result = await _send_rubika_message(guid, text, reply_to)
             return True, result
         except Exception as e:
             log.error(f"SEND ERROR: {e}")
@@ -5749,7 +5909,7 @@ def add_security_headers(response):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(self), camera=()"
     # HSTS for HTTPS (only enable if behind TLS termination)
     # response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
@@ -5802,11 +5962,13 @@ def protect_dashboard_and_api():
             return jsonify({"error": "Rate limit exceeded"}), 429
 
     if not DASHBOARD_PASSWORD:
+        log.warning("HTTP AUTH BLOCK path=%s reason=password_missing", request.path)
         return jsonify({
             "error": "Dashboard is locked. Set DASHBOARD_PASSWORD first."
         }), 503
     if _dashboard_authorized():
         return None
+    log.warning("HTTP AUTH REJECT path=%s method=%s", request.path, request.method)
     return Response(
         "Authentication required",
         401,
@@ -6527,11 +6689,13 @@ async function sendChat(){
   const loading=document.createElement('div');loading.className='msg msg-ai';loading.id='loading-msg';
   loading.innerHTML='<div class="spinner"></div><div class="msg-meta"><i class="fas fa-robot"></i> در حال پردازش...</div>';
   box.appendChild(loading);box.scrollTop=box.scrollHeight;
+  const controller=new AbortController();
+  const requestTimer=setTimeout(()=>controller.abort(),90000);
   try{
-    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:t})});
-    const d=await r.json();
+    const r=await fetch('/api/chat',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:t}),signal:controller.signal});
+    const d=await r.json().catch(()=>({}));
     document.getElementById('loading-msg')?.remove();
-    if(!r.ok)throw new Error(d.error||'خطای Agent');
+    if(!r.ok)throw new Error(d.detail||d.error||d.message||('HTTP '+r.status));
     const reply=document.createElement('div');reply.className='msg msg-ai';
     reply.innerHTML='<div>'+esc(d.reply||'خطا')+'</div><div class="msg-meta"><i class="fas fa-robot"></i> AI</div>';
     appendAudioPlayer(reply,d);box.appendChild(reply);
@@ -6539,8 +6703,9 @@ async function sendChat(){
     box.scrollTop=box.scrollHeight;
   }catch(e){
     document.getElementById('loading-msg')?.remove();
-    box.innerHTML+='<div class="msg msg-ai"><div>خطای شبکه</div><div class="msg-meta"><i class="fas fa-robot"></i> AI</div></div>';
-  }
+    const message=e?.name==='AbortError'?'پاسخ بیشتر از ۹۰ ثانیه طول کشید. لاگ Render را بررسی کن.':(e?.message||'خطای شبکه');
+    box.innerHTML+='<div class="msg msg-ai"><div>'+esc(message)+'</div><div class="msg-meta"><i class="fas fa-robot"></i> خطا</div></div>';
+  }finally{clearTimeout(requestTimer);}
 }
 document.getElementById('btn-chat-send').onclick=sendChat;
 document.getElementById('chat-in').onkeydown=e=>{if(e.key==='Enter')sendChat();};
@@ -6845,6 +7010,9 @@ async function loadConfig(){
       ['EDGE_TTS','موتور پاسخ صوتی'],
       ['AUTO_KB_MODE','حالت یادگیری دانش'],
       ['VOICE_FIRST_MODE','حالت پاسخ صوتی پیش‌فرض'],
+      ['GROUP_REPLY_MODE','حالت پاسخ در گروه'],
+      ['RESPOND_TO_SELF_MESSAGES','پاسخ به پیام‌های دستی خودم'],
+      ['DEBUG_DIAGNOSTICS','دیباگ تشخیصی'],
       ['RUBIKA_PHONE','شماره تلفن'],
     ];
     let html='<table class="config-table"><thead><tr><th>متغیر</th><th>وضعیت</th></tr></thead><tbody>';
@@ -6895,7 +7063,7 @@ def dashboard():
 def api_health():
     return jsonify({
         "status": "ok",
-        "version": "phase3-voice-v1.4-live-dashboard-control",
+        "version": "phase3-voice-v1.5-diagnostics",
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -6931,6 +7099,136 @@ def api_health_detailed():
         "checks": {**critical, **optional},
         "timestamp": datetime.now().isoformat(),
     }), 200 if healthy else 503
+
+
+def _session_diagnostics():
+    """Inspect session integrity without returning auth/private-key material."""
+    result = {
+        "exists": os.path.isfile(SESSION_FILE),
+        "bytes": 0,
+        "sqlite_integrity": None,
+        "tables": [],
+        "session_rows": None,
+        "error": None,
+    }
+    if not result["exists"]:
+        return result
+    try:
+        result["bytes"] = os.path.getsize(SESSION_FILE)
+        import sqlite3
+        absolute = os.path.abspath(SESSION_FILE)
+        uri = "file:" + quote(absolute, safe="/:\\") + "?mode=ro"
+        db = sqlite3.connect(uri, uri=True, timeout=1)
+        try:
+            result["sqlite_integrity"] = db.execute("PRAGMA integrity_check").fetchone()[0]
+            result["tables"] = [
+                str(row[0])[:80]
+                for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                ).fetchall()
+            ]
+            if "session" in result["tables"]:
+                result["session_rows"] = int(
+                    db.execute('SELECT COUNT(*) FROM "session"').fetchone()[0]
+                )
+        finally:
+            db.close()
+    except Exception as exc:
+        result["error"] = type(exc).__name__
+    return result
+
+
+@app.route("/api/diagnostics")
+def api_diagnostics():
+    """Protected, secret-free runtime diagnostics for deployment debugging."""
+    loop = main_loop
+    with _lock_hist:
+        agent_sessions = len(agent_chat_histories)
+        normal_sessions = len(chat_histories)
+    with _lock_logs:
+        log_count = len(chat_logs)
+    with _lock_pending:
+        pending_count = len(pending_replies)
+    return jsonify({
+        "status": "ok",
+        "debug_enabled": DEBUG_DIAGNOSTICS,
+        "config": {
+            "gemini_keys": len(GEMINI_API_KEYS),
+            "model_enabled": bool(model),
+            "agent_enabled": bool(agent_model),
+            "owner_guids": len(OWNER_GUIDS),
+            "owner_masks": [_mask_guid(item) for item in sorted(OWNER_GUIDS)],
+            "control_group_mask": _mask_guid(OWNER_CONTROL_GROUP) if OWNER_CONTROL_GROUP else "-",
+            "trigger_word": TRIGGER_WORD,
+            "group_reply_mode": GROUP_REPLY_MODE,
+            "respond_to_self_messages": RESPOND_TO_SELF_MESSAGES,
+            "bot_message_fingerprint_ttl_seconds": BOT_MESSAGE_FINGERPRINT_TTL_SECONDS,
+            "gemini_timeout_seconds": GEMINI_REQUEST_TIMEOUT_SECONDS,
+            "tts_available": edge_tts is not None,
+            "stt_configured": bool(GROQ_API_KEY),
+        },
+        "runtime": {
+            "main_loop_exists": loop is not None,
+            "main_loop_running": bool(loop is not None and loop.is_running()),
+            "main_loop_closed": bool(loop is not None and loop.is_closed()),
+            "my_guid_mask": _mask_guid(MY_GUID),
+            "client_guid_mask": _mask_guid(getattr(client, "guid", "")),
+            "agent_sessions": agent_sessions,
+            "normal_sessions": normal_sessions,
+            "chat_logs": log_count,
+            "pending_replies": pending_count,
+            "session": _session_diagnostics(),
+        },
+        "diagnostics": _diagnostic_snapshot(),
+        "timestamp": datetime.now(SERVER_TZ).isoformat(timespec="seconds"),
+    })
+
+
+@app.route("/api/diagnostics/probe")
+def api_diagnostics_probe():
+    """Optional one-shot no-tools Gemini probe; run only with ?run=1."""
+    if str(request.args.get("run", "")).strip().casefold() not in {"1", "true", "yes"}:
+        return jsonify({
+            "ok": True,
+            "message": "برای مصرف یک درخواست آزمایشی Gemini، پارامتر run=1 را اضافه کن.",
+        })
+    if not GEMINI_API_KEYS or not model:
+        _diag_record("gemini_probe_error", reason="model_disabled")
+        return jsonify({"ok": False, "error": "Gemini model is disabled"}), 503
+    started = time.monotonic()
+    try:
+        def _probe():
+            probe_model = genai.GenerativeModel(
+                GEMINI_MODEL, system_instruction="فقط پاسخ کوتاه OK بده.",
+            )
+            probe_chat = probe_model.start_chat(
+                history=[], enable_automatic_function_calling=False
+            )
+            return _gemini_send_message(probe_chat, "تست اتصال؛ فقط بنویس OK")
+
+        response = execute_with_rotation(_probe)
+        text = response_text(response)[:100]
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _diag_record("gemini_probe_ok", elapsed_ms=elapsed_ms)
+        log.info("GEMINI PROBE OK elapsed_ms=%s", elapsed_ms)
+        return jsonify({"ok": True, "response_chars": len(text), "elapsed_ms": elapsed_ms})
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _diag_record(
+            "gemini_probe_error",
+            elapsed_ms=elapsed_ms,
+            exception=type(exc).__name__,
+            error=exc,
+        )
+        log.error(
+            "GEMINI PROBE ERROR type=%s detail=%s",
+            type(exc).__name__, _diagnostic_error(exc), exc_info=True
+        )
+        return jsonify({
+            "ok": False,
+            "error": _diagnostic_error(exc) if DEBUG_DIAGNOSTICS else "Gemini probe failed",
+            "elapsed_ms": elapsed_ms,
+        }), 502
 
 
 @app.route("/download/<path:filename>")
@@ -7198,25 +7496,36 @@ def _process_dashboard_message(msg, actor):
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     # Rate limit: 20 requests/minute per IP for chat
+    started = time.monotonic()
     client_ip = _get_client_ip()
+    log.info("DASHBOARD CHAT START ip=%s", _mask_guid(client_ip))
+    _diag_record("dashboard_chat_started")
     if not _check_rate_limit(f"chat:{client_ip}", DEFAULT_CHAT_RATE_LIMIT, 60):
+        _diag_record("dashboard_chat_rate_limited")
         return jsonify({"error": "Chat rate limit exceeded"}), 429
 
     data = request.get_json(silent=True) or {}
     msg = (data.get("msg") or "").strip()
     if not msg:
+        _diag_record("dashboard_chat_bad_request", reason="empty")
+        log.warning("DASHBOARD CHAT REJECT reason=empty")
         return jsonify({"error": "Empty"}), 400
     if len(msg) > 4000:
+        _diag_record("dashboard_chat_bad_request", reason="too_long")
+        log.warning("DASHBOARD CHAT REJECT reason=too_long chars=%s", len(msg))
         return jsonify({"error": "Message is too long"}), 413
     # Sanitize input - reject potential injection attempts
     if _contains_injection_patterns(msg):
-        log.warning("Potential injection attempt from %s: %s", client_ip, msg[:100])
+        _diag_record("dashboard_chat_bad_request", reason="sanitization")
+        log.warning("DASHBOARD CHAT REJECT reason=sanitization chars=%s", len(msg))
         return jsonify({"error": "Invalid input"}), 400
     actor = f"dashboard:{client_ip}"
     try:
         _update_owner_style_from_feedback(msg, True)
         proactive = _maybe_daily_briefing("dashboard")
         handoff = _cross_surface_handoff("dashboard", msg)
+        _diag_record("dashboard_agent_start", prompt_text=msg)
+        log.info("DASHBOARD AGENT START chars=%s", len(msg))
         reply, mode = _process_dashboard_message(msg, actor)
         prefixes = [item for item in (proactive, handoff) if item]
         if prefixes:
@@ -7233,6 +7542,11 @@ def api_chat():
         audio_b64, audio_mime, tts_error = _optional_dashboard_audio(
             reply, _should_reply_with_voice(msg)
         )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _diag_record(
+            "dashboard_chat_ok", mode=mode, elapsed_ms=elapsed_ms, reply_text=reply
+        )
+        log.info("DASHBOARD CHAT OK mode=%s elapsed_ms=%s", mode, elapsed_ms)
         return jsonify({
             "reply": reply,
             "mode": mode,
@@ -7241,8 +7555,20 @@ def api_chat():
             "tts_error": tts_error or None,
         })
     except Exception as exc:
-        log.error("DASHBOARD CHAT ERROR: %s", exc, exc_info=True)
-        return jsonify({"error": "Agent temporarily unavailable"}), 500
+        _diag_record(
+            "dashboard_chat_error",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            exception=type(exc).__name__,
+            error=exc,
+        )
+        log.error(
+            "DASHBOARD CHAT ERROR type=%s detail=%s",
+            type(exc).__name__, _diagnostic_error(exc), exc_info=True
+        )
+        return jsonify({
+            "error": "Agent temporarily unavailable",
+            "detail": _diagnostic_error(exc) if DEBUG_DIAGNOSTICS else None,
+        }), 500
 
 
 @app.route("/api/voice/chat", methods=["POST"])
@@ -7692,9 +8018,15 @@ def api_config():
             "OWNER_NAME": OWNER_NAME,
             "AUTO_KB_MODE": AUTO_KB_MODE,
             "VOICE_FIRST_MODE": _voice_first_enabled(),
+            "DEBUG_DIAGNOSTICS": DEBUG_DIAGNOSTICS,
+            "GROUP_REPLY_MODE": GROUP_REPLY_MODE,
+            "RESPOND_TO_SELF_MESSAGES": RESPOND_TO_SELF_MESSAGES,
         },
         "settings": {
             "auto_kb_mode": AUTO_KB_MODE,
+            "group_reply_mode": GROUP_REPLY_MODE,
+            "respond_to_self_messages": RESPOND_TO_SELF_MESSAGES,
+            "gemini_timeout_seconds": GEMINI_REQUEST_TIMEOUT_SECONDS,
             "voice_first_mode": _voice_first_enabled(),
             "tts_voice": VOICE_TTS_VOICE,
             "kb_suggestions": kb_suggestion_count,
@@ -7849,10 +8181,31 @@ def _send_agent_message(
     _agent_context.chat_guid = str(chat_guid or "")[:120]
     _agent_context.user_prompt = original_prompt
     _agent_context.search_result = None
+    started = time.monotonic()
+    _diag_record(
+        "gemini_agent_started",
+        surface=_surface_name(chat_guid),
+        session=session_key or "default",
+        prompt_text=original_prompt,
+    )
     try:
-        response = chat.send_message(model_prompt)
+        response = _gemini_send_message(chat, model_prompt)
         _record_agent_history_metadata(session_key, chat)
+        _diag_record(
+            "gemini_agent_ok",
+            surface=_surface_name(chat_guid),
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
         return response
+    except Exception as exc:
+        _diag_record(
+            "gemini_agent_error",
+            surface=_surface_name(chat_guid),
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            exception=type(exc).__name__,
+            error=exc,
+        )
+        raise
     finally:
         for field in ("actor", "chat_guid", "user_prompt", "search_result"):
             try:
@@ -7886,7 +8239,8 @@ def _trim_agent_session(session_key, chat):
         summary_chat = summarizer.start_chat(
             history=history, enable_automatic_function_calling=False
         )
-        summary_response = summary_chat.send_message(
+        summary_response = _gemini_send_message(
+            summary_chat,
             "گفت‌وگوی بالا را در ۲ تا ۳ جملهٔ کوتاه فارسی خلاصه کن. "
             "موضوع، تصمیم‌ها و کارهای ناتمام را نگه دار؛ فقط خلاصهٔ خالص را بنویس."
         )
@@ -7977,17 +8331,26 @@ def execute_agent_with_rotation_sync(
     session_key, prompt_text, actor, chat_guid="", handoff_text=""
 ):
     max_tries = max(1, len(GEMINI_API_KEYS))
+    session_lock = _get_agent_session_lock(session_key)
     for attempt in range(max_tries):
-        chat = get_agent_chat_session(session_key)
-        if not chat:
-            raise RuntimeError("Agent is disabled or session is unavailable")
         try:
-            response = _send_agent_message(
-                chat, prompt_text, actor, chat_guid, handoff_text, session_key
-            )
-            _trim_agent_session(session_key, chat)
+            with session_lock:
+                chat = get_agent_chat_session(session_key)
+                if not chat:
+                    raise RuntimeError("Agent is disabled or session is unavailable")
+                response = _send_agent_message(
+                    chat, prompt_text, actor, chat_guid, handoff_text, session_key
+                )
+                _trim_agent_session(session_key, chat)
+            _diag_record("agent_request_ok", surface=_surface_name(chat_guid))
             return response
         except Exception as exc:
+            _diag_record(
+                "agent_request_error",
+                surface=_surface_name(chat_guid),
+                exception=type(exc).__name__,
+                error=exc,
+            )
             if _is_rate_limit_error(exc):
                 log.warning("⚠️ محدودیت Gemini Agent؛ تلاش %s/%s", attempt + 1, max_tries)
                 if not switch_api_key():
@@ -8001,18 +8364,29 @@ async def async_execute_agent_with_rotation(
     session_key, prompt_text, actor, chat_guid="", handoff_text=""
 ):
     max_tries = max(1, len(GEMINI_API_KEYS))
+    session_lock = _get_agent_session_lock(session_key)
     for attempt in range(max_tries):
-        chat = get_agent_chat_session(session_key)
-        if not chat:
-            raise RuntimeError("Agent is disabled or session is unavailable")
         try:
-            response = await asyncio.to_thread(
-                _send_agent_message,
-                chat, prompt_text, actor, chat_guid, handoff_text, session_key
-            )
-            _trim_agent_session(session_key, chat)
+            # The lock spans the stateful ChatSession transaction. The network
+            # work itself runs off the Rubika event loop.
+            with session_lock:
+                chat = get_agent_chat_session(session_key)
+                if not chat:
+                    raise RuntimeError("Agent is disabled or session is unavailable")
+                response = await asyncio.to_thread(
+                    _send_agent_message,
+                    chat, prompt_text, actor, chat_guid, handoff_text, session_key
+                )
+                _trim_agent_session(session_key, chat)
+            _diag_record("agent_request_ok", surface=_surface_name(chat_guid))
             return response
         except Exception as exc:
+            _diag_record(
+                "agent_request_error",
+                surface=_surface_name(chat_guid),
+                exception=type(exc).__name__,
+                error=exc,
+            )
             if _is_rate_limit_error(exc):
                 log.warning("⚠️ محدودیت Gemini Agent؛ تلاش %s/%s", attempt + 1, max_tries)
                 if not switch_api_key():
@@ -8046,18 +8420,25 @@ def get_chat_session(chat_guid):
 
 async def async_execute_with_rotation(chat_guid, prompt_text):
     max_tries = max(1, len(GEMINI_API_KEYS))
+    session_lock = _get_agent_session_lock("plain:" + str(chat_guid))
     for attempt in range(max_tries):
-        chat = get_chat_session(chat_guid)
-        if not chat:
-            raise Exception("AI is disabled or chat session not found")
         try:
-            try:
-                response = await asyncio.to_thread(chat.send_message, prompt_text)
-            except TypeError:
-                loop = asyncio.get_running_loop()
-                response = await loop.run_in_executor(None, chat.send_message, prompt_text)
+            with session_lock:
+                chat = get_chat_session(chat_guid)
+                if not chat:
+                    raise Exception("AI is disabled or chat session not found")
+                response = await asyncio.to_thread(
+                    _gemini_send_message, chat, prompt_text
+                )
+            _diag_record("plain_request_ok", surface=_surface_name(chat_guid))
             return response
         except Exception as e:
+            _diag_record(
+                "plain_request_error",
+                surface=_surface_name(chat_guid),
+                exception=type(e).__name__,
+                error=e,
+            )
             if _is_rate_limit_error(e):
                 log.warning(f"⚠️ ارور لیمیت جمینای در محیط async. تلاش {attempt+1}/{max_tries}")
                 if not switch_api_key():
@@ -8071,27 +8452,64 @@ async def async_execute_with_rotation(chat_guid, prompt_text):
 async def handle_messages(update: Updates):
     global main_loop
 
+    # Extract routing fields before any early return so a disabled/partial
+    # model can never make an incoming update look invisible in diagnostics.
+    chat_guid = getattr(update, "object_guid", "") or ""
+    user_text = getattr(update, "text", None)
+    author_guid = getattr(update, "author_guid", "") or ""
+    message_id = _extract_msg_id(update)
+    try:
+        update_type = getattr(update, "type", "") or ""
+    except Exception:
+        update_type = "unknown"
+    _diag_record(
+        "rubika_update_received",
+        update_type=update_type,
+        chat=_mask_guid(chat_guid),
+        author=_mask_guid(author_guid),
+        message_id=message_id or "-",
+        text_chars=len(str(user_text or "")),
+    )
+    log.info(
+        "RUBIKA UPDATE type=%s chat=%s author=%s text_chars=%s",
+        update_type or "?", _mask_guid(chat_guid), _mask_guid(author_guid),
+        len(str(user_text or "")),
+    )
+
     # ✅ باگ #4: تنظیم main_loop فقط یکبار
     if main_loop is None:
         main_loop = asyncio.get_running_loop()
         main_loop_ready.set()
 
     if not model:
+        _diag_record("rubika_drop_model_disabled")
+        log.warning("RUBIKA DROP reason=model_disabled")
         return  # AI غیرفعاله
 
-    chat_guid = getattr(update, "object_guid", "") or ""
-    user_text = getattr(update, "text", None)
-    author_guid = getattr(update, "author_guid", "") or ""
     owner_authorized = is_owner_message(author_guid, chat_guid)
-    message_id = _extract_msg_id(update)
+    manual_owner_message = False
     voice_input = False
 
-    # ✅ باگ #1: جلوگیری از حلقه جواب‌به‌خود (نادیده گرفتن پیام‌های ارسال‌شده توسط اکانت ربات)
+    # A Rubika user session gives manual messages and bot replies the same
+    # author GUID.  Drop only messages present in the bot outgoing ledger; an
+    # untracked self-authored text is a manual owner input and may be answered.
     me_guid = norm_id(MY_GUID or getattr(client, "guid", None))
     if me_guid and author_guid and norm_id(author_guid) == me_guid:
-        if message_id:
-            _add_bot_sent_id(message_id)
-        return
+        bot_generated = _is_tracked_bot_message(chat_guid, user_text, message_id)
+        if bot_generated:
+            if message_id:
+                _add_bot_sent_id(message_id)
+            _diag_record("rubika_drop_bot_message")
+            log.info("RUBIKA DROP reason=bot_message chat=%s", _mask_guid(chat_guid))
+            return
+        if not RESPOND_TO_SELF_MESSAGES:
+            _diag_record("rubika_drop_self_disabled")
+            log.info("RUBIKA DROP reason=self_messages_disabled chat=%s", _mask_guid(chat_guid))
+            return
+        manual_owner_message = True
+        owner_authorized = True
+        _diag_record("rubika_self_owner_input")
+        log.info("RUBIKA SELF INPUT owner_manual=true chat=%s", _mask_guid(chat_guid))
 
     if _is_voice_update(update):
         if not owner_authorized:
@@ -8100,10 +8518,11 @@ async def handle_messages(update: Updates):
                 _mask_guid(chat_guid),
                 _mask_guid(author_guid),
             )
+            _diag_record("rubika_drop_voice_non_owner")
             return
         acquired = _voice_processing_semaphore.acquire(blocking=False)
         if not acquired:
-            await update.reply("سرویس ویس مشغول است؛ چند لحظه دیگر دوباره امتحان کنید.")
+            await _reply_and_track(update, "سرویس ویس مشغول است؛ چند لحظه دیگر دوباره امتحان کنید.")
             return
         try:
             size, mime, filename = _voice_update_metadata(update)
@@ -8130,16 +8549,18 @@ async def handle_messages(update: Updates):
                 len(user_text),
             )
         except VoiceProcessingError as exc:
-            await update.reply(f"❌ پردازش ویس ناموفق بود: {exc}")
+            await _reply_and_track(update, f"❌ پردازش ویس ناموفق بود: {exc}")
             return
         except Exception as exc:
             log.error("VOICE DOWNLOAD/STT ERROR: %s", exc, exc_info=True)
-            await update.reply("❌ پردازش ویس به‌دلیل خطای داخلی ناموفق بود.")
+            await _reply_and_track(update, "❌ پردازش ویس به‌دلیل خطای داخلی ناموفق بود.")
             return
         finally:
             _voice_processing_semaphore.release()
 
     if not user_text:
+        _diag_record("rubika_drop_empty_text")
+        log.info("RUBIKA DROP reason=empty_text chat=%s", _mask_guid(chat_guid))
         return
 
     incoming_user_text = str(user_text)[:3000]
@@ -8165,10 +8586,11 @@ async def handle_messages(update: Updates):
     )
     if confirm_match or cancel_match:
         if not owner_authorized or not chat_guid.startswith("u0"):
-            await update.reply("تأیید عملیات فقط در چت خصوصی مالک مجاز است.")
+            _diag_record("rubika_drop_confirmation_unauthorized")
+            await _reply_and_track(update, "تأیید عملیات فقط در چت خصوصی مالک مجاز است.")
             return
         if voice_input:
-            await update.reply("برای امنیت، کد تأیید روبیکا را به‌صورت متن ارسال کنید.")
+            await _reply_and_track(update, "برای امنیت، کد تأیید روبیکا را به‌صورت متن ارسال کنید.")
             return
         code = (confirm_match or cancel_match).group(1).casefold()
         if confirm_match:
@@ -8187,11 +8609,19 @@ async def handle_messages(update: Updates):
         return
 
     log.info(
-        "ROUTE owner=%s chat=%s author=%s configured=%s",
+        "ROUTE owner=%s chat=%s author=%s configured=%s group_mode=%s",
         owner_authorized,
         _mask_guid(chat_guid),
         _mask_guid(author_guid),
         ",".join(_mask_guid(guid) for guid in sorted(OWNER_GUIDS)) or "none",
+        GROUP_REPLY_MODE,
+    )
+    _diag_record(
+        "rubika_route",
+        owner=owner_authorized,
+        private=chat_guid.startswith("u0"),
+        group_mode=GROUP_REPLY_MODE,
+        text_chars=len(incoming_user_text),
     )
 
     # ──── ثبت لاگ ────
@@ -8237,18 +8667,18 @@ async def handle_messages(update: Updates):
                             f"کاربر پرسید: '{original['user_text']}'، "
                             f"پاسخ من: '{user_text}'، حالا با لحن خودت بگو."
                         )
-                        return chat.send_message(prompt)
+                        return _gemini_send_message(chat, prompt)
                     final_answer = execute_with_rotation(_control_reply).text
                 except Exception:
                     final_answer = user_text
 
                 try:
-                    await client.send_message(
+                    await _send_rubika_message(
                         original["chat_guid"],
                         final_answer,
-                        reply_to_message_id=original.get("message_id"),
+                        reply_to=original.get("message_id"),
                     )
-                    await update.reply("✅ پاسخ ارسال شد!")
+                    await _reply_and_track(update, "✅ پاسخ ارسال شد!")
                     if owner_authorized:
                         _record_unified_interaction(
                             source_name, original.get("user_text", user_text), final_answer,
@@ -8263,13 +8693,22 @@ async def handle_messages(update: Updates):
                     with _lock_pending:
                         pending_replies[reply_str] = original
                     save_pending()
-                    await update.reply(f"❌ خطا: {e}")
+                    await _reply_and_track(update, f"❌ خطا: {e}")
                 return
 
     # ──── فیلتر پیام ────
     is_private = chat_guid.startswith("u0")
     if is_private:
         if author_guid and author_guid != chat_guid:
+            _diag_record(
+                "rubika_drop_private_author_mismatch",
+                chat=_mask_guid(chat_guid),
+                author=_mask_guid(author_guid),
+            )
+            log.info(
+                "RUBIKA DROP reason=private_author_mismatch chat=%s author=%s",
+                _mask_guid(chat_guid), _mask_guid(author_guid),
+            )
             return
     else:
         reply_str = get_reply_to_id(update)
@@ -8288,7 +8727,12 @@ async def handle_messages(update: Updates):
         # حالا فقط برای پیام‌هایی اجرا می‌شود که در غیر این صورت کلاً نادیده گرفته می‌شدند
         # (بدون کلمهٔ ماشه و بدون ریپلای به ربات)؛ بقیه از مسیر اصلی پایین رد می‌شوند.
         has_trigger = bool(_TRIGGER_WORD_PATTERN.search(user_text))
-        if not is_reply_to_bot and not has_trigger:
+        if (
+            GROUP_REPLY_MODE == "trigger"
+            and not manual_owner_message
+            and not is_reply_to_bot
+            and not has_trigger
+        ):
             if await _try_handle_direct_web_request(
                 update,
                 user_text,
@@ -8299,8 +8743,14 @@ async def handle_messages(update: Updates):
                 prefix_text=_maybe_daily_briefing(source_name) if owner_authorized else "",
                 handoff_text=handoff_text,
             ):
+                _diag_record("rubika_direct_web_reply")
                 return
             # نه ماشه، نه ریپلای، نه درخواست وب ⇒ نادیده بگیر
+            _diag_record("rubika_drop_group_no_trigger")
+            log.info(
+                "RUBIKA DROP reason=group_no_trigger chat=%s trigger=%s",
+                _mask_guid(chat_guid), TRIGGER_WORD,
+            )
             return
 
         log.info("FLOW_CHECK after direct search, proceeding to trigger word check")
@@ -8310,24 +8760,28 @@ async def handle_messages(update: Updates):
             if not user_text:
                 user_text = "سلام"
             if not is_reply_to_bot:
-                with _lock_hist:
-                    if model:
+                if model:
+                    with _lock_hist:
                         chat_histories[chat_guid] = model.start_chat(history=[])
                         while len(chat_histories) > MAX_CHAT_HISTORIES:
                             chat_histories.popitem(last=False)
-                    if owner_authorized and agent_model:
-                        agent_chat_histories[UNIFIED_OWNER_SESSION_KEY] = agent_model.start_chat(
-                            history=[], enable_automatic_function_calling=True
-                        )
-                        _agent_turn_meta.pop(UNIFIED_OWNER_SESSION_KEY, None)
-                        while len(agent_chat_histories) > MAX_CHAT_HISTORIES:
-                            agent_chat_histories.popitem(last=False)
+                if owner_authorized and agent_model:
+                    # Match execute_agent_with_rotation's lock order:
+                    # session lock first, then _lock_hist.
+                    with _get_agent_session_lock(UNIFIED_OWNER_SESSION_KEY):
+                        with _lock_hist:
+                            agent_chat_histories[UNIFIED_OWNER_SESSION_KEY] = agent_model.start_chat(
+                                history=[], enable_automatic_function_calling=True
+                            )
+                            _agent_turn_meta.pop(UNIFIED_OWNER_SESSION_KEY, None)
+                            while len(agent_chat_histories) > MAX_CHAT_HISTORIES:
+                                agent_chat_histories.popitem(last=False)
                 log.info("NEW  تاریخچه چت%s ریست شد", " Agent" if owner_authorized else "")
 
     if owner_authorized:
         proactive_text = _maybe_daily_briefing(source_name)
 
-    log.info(f"MSG  {chat_guid} | {user_text[:50]}")
+    log.info("MSG  chat=%s text_chars=%s", _mask_guid(chat_guid), len(str(user_text)))
 
     # خواندن/آماده‌سازی عملیات روبیکا با refهای موقت؛ نوشتن هنوز نیازمند تأیید است.
     control_command = (
@@ -8467,7 +8921,23 @@ async def handle_messages(update: Updates):
                 response = await async_execute_with_rotation(chat_guid, prompt_text)
                 chat = get_chat_session(chat_guid)
         except Exception as exc:
+            _diag_record(
+                "rubika_ai_error",
+                exception=type(exc).__name__,
+                error=exc,
+                surface=source_name,
+            )
             log.error("ERROR in AI/Agent response generation: %s", exc, exc_info=True)
+            try:
+                await _reply_and_track(
+                    update, "⚠️ پاسخ‌گویی موقتاً با خطا روبه‌رو شد؛ چند لحظه بعد دوباره امتحان کن."
+                )
+            except Exception as reply_exc:
+                _diag_record(
+                    "rubika_error_reply_failed",
+                    exception=type(reply_exc).__name__,
+                    error=reply_exc,
+                )
             return
 
         raw_ai_text = response_text(response)
@@ -8509,10 +8979,10 @@ async def handle_messages(update: Updates):
                 try:
                     notif = (
                         f"❓ سوال: {user_text}\n"
-                        f"🆔 {chat_guid}\n"
+                        f"🆔 {_mask_guid(chat_guid)}\n"
                         f"⬅️ ریپلای کن"
                     )
-                    sent_notif = await client.send_message(
+                    sent_notif = await _send_rubika_message(
                         OWNER_CONTROL_GROUP, notif
                     )
                     nid = _extract_msg_id(sent_notif)
@@ -8537,7 +9007,15 @@ async def handle_messages(update: Updates):
                 if sid is not None:
                     _add_bot_sent_id(sid)
                     log.info(f"REPLY  tracked sent_msg_id={sid}")
+                _diag_record(
+                    "rubika_reply_ok",
+                    owner=owner_authorized,
+                    surface=source_name,
+                    reply_text=ai_text,
+                    pending=True,
+                )
             except Exception as e:
+                _diag_record("rubika_reply_error", exception=type(e).__name__, error=e)
                 log.error(f"REPLY ERROR: {e}")
         else:
             sent = await _reply_text_and_voice(
@@ -8551,6 +9029,12 @@ async def handle_messages(update: Updates):
                     "AGENT" if owner_authorized else "AI",
                     sid,
                 )
+            _diag_record(
+                "rubika_reply_ok",
+                owner=owner_authorized,
+                surface=source_name,
+                reply_text=ai_text,
+            )
             log.info("%s  پاسخ مستقیم", "AGENT" if owner_authorized else "AI")
 
         if owner_authorized:
@@ -8591,15 +9075,23 @@ if __name__ == "__main__":
 
     print("=" * 55)
     print("🚀 Bot + Dashboard running")
-    print(f"📬 Control Group : {OWNER_CONTROL_GROUP or 'غیرفعال'}")
+    print(f"📬 Control Group : {_mask_guid(OWNER_CONTROL_GROUP) if OWNER_CONTROL_GROUP else 'غیرفعال'}")
     print(f"👤 Agent Owners  : {'✅ ' + str(len(OWNER_GUIDS)) + ' GUID' if OWNER_GUIDS else '❌ OWNER_GUIDS تنظیم نشده'}")
     if OWNER_GUIDS:
         print("🔎 Owner Masks   : " + ", ".join(_mask_guid(g) for g in sorted(OWNER_GUIDS)))
     print(f"⚡ Reply Delay   : {REPLY_DELAY_MIN:.1f}–{REPLY_DELAY_MAX:.1f}s")
     print(f"🔐 Dashboard     : {'✅ محافظت‌شده' if DASHBOARD_PASSWORD else '🔒 قفل؛ DASHBOARD_PASSWORD تنظیم نشده'}")
     print(f"🔑 Gemini API    : {'✅ فعال (' + str(len(GEMINI_API_KEYS)) + ' کلید)' if GEMINI_API_KEYS else '❌ غیرفعال'}")
-    print(f"🔑 Rubika Session: {'✅ موجود' if os.path.exists(SESSION_FILE) else '❌ ناموجود'}")
+    session_diag = _session_diagnostics()
+    session_state = (
+        f"bytes={session_diag.get('bytes', 0)} "
+        f"sqlite={session_diag.get('sqlite_integrity') or 'n/a'} "
+        f"rows={session_diag.get('session_rows') if session_diag.get('session_rows') is not None else 'n/a'}"
+    )
+    print(f"🔑 Rubika Session: {'✅ موجود' if session_diag.get('exists') else '❌ ناموجود'} | {session_state}")
     print(f"🛠️ Server Tools  : ✅ فعال | TZ={SERVER_TIMEZONE_NAME} | Delivery={AUTOMATION_DELIVERY_MODE}")
+    print(f"🧪 Diagnostics   : {'✅ فعال' if DEBUG_DIAGNOSTICS else 'خاموش'} | GroupMode={GROUP_REPLY_MODE} | GeminiTimeout={GEMINI_REQUEST_TIMEOUT_SECONDS}s")
+    print(f"🔁 Self messages : {'✅ پاسخ می‌دهد' if RESPOND_TO_SELF_MESSAGES else '❌ نادیده می‌گیرد'} | fingerprint_ttl={BOT_MESSAGE_FINGERPRINT_TTL_SECONDS}s")
     print(
         f"🎙️ Voice         : STT={'✅' if GROQ_API_KEY else '❌'} "
         f"| TTS={'✅' if edge_tts is not None else '❌'} | {VOICE_TTS_VOICE}"
@@ -8623,7 +9115,7 @@ if __name__ == "__main__":
                 getattr(getattr(me, "user", None), "user_guid", None)
                 or getattr(client, "guid", None)
             )
-            log.info("[BOOT] MY_GUID = %s", MY_GUID)
+            log.info("[BOOT] MY_GUID_MASK = %s", _mask_guid(MY_GUID))
         except Exception as e:
             log.warning("[BOOT] get_me failed: %s", e)
 
