@@ -8729,7 +8729,6 @@ async def handle_messages(update: Updates):
         has_trigger = bool(_TRIGGER_WORD_PATTERN.search(user_text))
         if (
             GROUP_REPLY_MODE == "trigger"
-            and not manual_owner_message
             and not is_reply_to_bot
             and not has_trigger
         ):
